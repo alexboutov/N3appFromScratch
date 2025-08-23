@@ -1,15 +1,15 @@
 package com.example.n3appfromscratch;
 
-import android.os.Bundle;
-import android.util.Log;
 import androidx.appcompat.app.AppCompatActivity;
 
+import android.os.Bundle;
+import android.util.Log;
+import android.view.WindowManager;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.content.Context;
-import android.view.WindowManager;
 
 import com.example.n3appfromscratch.databinding.ActivityMainBinding;
 
@@ -18,6 +18,8 @@ import java.util.Locale;
 public class MainActivity extends AppCompatActivity implements SensorEventListener {
 
     private static final String TAG = "Nat3_Sensors";
+    private static final String HEADER =
+            "t,dt,accX,accY,accZ,linX,linY,linZ,gyrX,gyrY,gyrZ,magX,magY,magZ";
 
     private ActivityMainBinding binding;
     private SensorManager sm;
@@ -26,9 +28,12 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     // Logging toggle & timing
     private boolean isLogging = false;
     private double lastTickSec = -1.0;
-    private boolean tickOnLinear = true; // prefer LIN as the "tick"; fallback to ACC if LIN missing
+    private boolean tickOnLinear = true; // prefer LIN as the "tick"; fallback to ACC
 
-    // Latest values cache (used to print all columns every tick)
+    // File logger
+    private CsvLogger csv;
+
+    // Latest values cache
     private float accX = Float.NaN, accY = Float.NaN, accZ = Float.NaN;   // raw accelerometer
     private float linX = Float.NaN, linY = Float.NaN, linZ = Float.NaN;   // linear acceleration
     private float gyrX = Float.NaN, gyrY = Float.NaN, gyrZ = Float.NaN;   // gyroscope
@@ -40,7 +45,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         binding = ActivityMainBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
 
-        // Keep screen on during tests
+        // Keep the screen on while this Activity is visible
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         sm = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
@@ -50,7 +55,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         gyro   = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
         mag    = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
 
-        tickOnLinear = (accLin != null); // if device has LIN, use it as sampling "tick"; else use ACC
+        tickOnLinear = (accLin != null); // if device has LIN, use it as sampling "tick"; else ACC
 
         String info = "Sensors: "
                 + ((accLin!=null)?"LINACC ":"")
@@ -59,21 +64,29 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 + ((mag!=null)?"MAG ":"");
         binding.tvInfo.setText(info);
 
-        // Toggle START/STOP
+        // START/STOP toggle
         binding.btnStartStop.setOnClickListener(v -> {
             if (!isLogging) {
                 // START
                 isLogging = true;
                 lastTickSec = -1.0;
-                printHeader();
+                csv = new CsvLogger(this);
+                csv.start(HEADER);                // file header
+                Log.i(TAG, HEADER);               // optional: header to Logcat
                 binding.btnStartStop.setText("STOP");
-                Log.i(TAG, "# START");
+                Log.i(TAG, "# START" + (csv != null && csv.getFile()!=null
+                        ? " file=" + csv.getFile().getAbsolutePath() : ""));
             } else {
                 // STOP
-                printHeader(); // repeat header on STOP as requested
+                if (csv != null) {
+                    csv.stop(HEADER);             // repeat header in file
+                }
+                Log.i(TAG, HEADER);               // optional: header to Logcat again
                 isLogging = false;
                 binding.btnStartStop.setText("START");
-                Log.i(TAG, "# STOP");
+                Log.i(TAG, "# STOP" + (csv != null && csv.getFile()!=null
+                        ? " file=" + csv.getFile().getAbsolutePath() : ""));
+                csv = null;
             }
         });
     }
@@ -93,6 +106,9 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     protected void onPause() {
         super.onPause();
         sm.unregisterListener(this);
+        // Be safe: close file if user backgrounds app
+        if (csv != null) { csv.close(); csv = null; }
+        if (isLogging) { isLogging = false; binding.btnStartStop.setText("START"); }
         Log.i(TAG, "onPause -> unregister");
     }
 
@@ -101,6 +117,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         final int type = event.sensor.getType();
         final double tSec = event.timestamp / 1e9;
 
+        // Update caches
         switch (type) {
             case Sensor.TYPE_ACCELEROMETER:
                 accX = event.values[0];
@@ -134,7 +151,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             double dt = (lastTickSec > 0) ? (tSec - lastTickSec) : 0.0;
             lastTickSec = tSec;
 
-            // CSV: t,dt,ACC,LIN,GYR,MAG (14 columns total)
+            // CSV: t,dt,ACC,LIN,GYR,MAG (14 columns)
             String row = String.format(
                     Locale.US,
                     "%.6f,%.6f," +   // t, dt
@@ -148,7 +165,10 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                     gyrX, gyrY, gyrZ,
                     magX, magY, magZ
             );
-            Log.d(TAG, row);
+
+            // File + Logcat
+            if (csv != null) csv.log(row);
+            Log.i(TAG, row);
 
             // Minimal UI heartbeat
             binding.tvVelocity.setText(String.format(Locale.US, "%.2f m/s", 0.00));
@@ -158,10 +178,5 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) {
         // Optional: log accuracy changes
-    }
-
-    // Header once on START, and again on STOP per your request
-    private void printHeader() {
-        Log.d(TAG, "t,dt,accX,accY,accZ,linX,linY,linZ,gyrX,gyrY,gyrZ,magX,magY,magZ");
     }
 }
