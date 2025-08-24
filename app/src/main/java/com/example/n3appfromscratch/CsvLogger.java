@@ -1,12 +1,14 @@
 package com.example.n3appfromscratch;
 
 import android.content.Context;
+import android.os.StatFs;
 import android.util.Log;
 
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.text.DecimalFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -16,49 +18,58 @@ class CsvLogger {
 
     private final Context ctx;
     private BufferedWriter out;
+    private File dir;
     private File file;
-    private boolean active = false;
+    private String header = "";
+    private String baseName = ""; // run_YYYYMMDD_HHMMSS
+    private int partIndex = 0;
+    private long maxBytes = Long.MAX_VALUE; // rotation threshold; set via setMaxBytes()
 
     CsvLogger(Context ctx) {
         this.ctx = ctx.getApplicationContext();
     }
 
+    /** Optional: set per-file size limit (bytes). Call before start(). */
+    void setMaxBytes(long bytes) {
+        this.maxBytes = Math.max(1L, bytes);
+    }
+
+    /** Begin a new run with a timestamped base name and write the header. */
     void start(String header) {
-        try {
-            File dir = new File(ctx.getExternalFilesDir(null), "logs");
-            if (!dir.exists() && !dir.mkdirs()) {
-                Log.e(TAG, "Failed to create logs dir: " + dir);
-                return;
-            }
-            String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-            file = new File(dir, "run_" + ts + ".csv");
-            out = new BufferedWriter(new FileWriter(file, /*append*/ true));
-            out.write(header);
-            out.newLine();
-            out.flush();
-            active = true;
+        this.header = (header == null) ? "" : header;
+        dir = new File(ctx.getExternalFilesDir(null), "logs");
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.e(TAG, "Failed to create logs dir: " + dir);
+            return;
+        }
+        baseName = "run_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        partIndex = 0;
+        rollToNextPart(); // opens _p01 and writes header
+        if (file != null) {
             Log.i(TAG, "Logging to: " + file.getAbsolutePath());
-        } catch (IOException e) {
-            Log.e(TAG, "CsvLogger.start error", e);
-            active = false;
-            close();
         }
     }
 
+    /** Write one CSV row; rotate to a new file if size threshold reached. */
     void log(String row) {
-        if (!active || out == null) return;
+        if (out == null) return;
         try {
             out.write(row);
             out.newLine();
+            // lightweight size check; rotate if needed
+            if (file != null && file.length() >= maxBytes) {
+                rollToNextPart();
+            }
         } catch (IOException e) {
             Log.e(TAG, "CsvLogger.log error", e);
         }
     }
 
+    /** Finish the run; append header again (per your requirement) and close. */
     void stop(String finalHeader) {
-        if (!active) return;
+        if (out == null) return;
         try {
-            if (out != null) {
+            if (finalHeader != null && !finalHeader.isEmpty()) {
                 out.write(finalHeader);
                 out.newLine();
                 out.flush();
@@ -66,17 +77,61 @@ class CsvLogger {
         } catch (IOException e) {
             Log.e(TAG, "CsvLogger.stop error", e);
         } finally {
-            active = false;
             close();
         }
     }
 
     void close() {
-        try {
-            if (out != null) out.close();
-        } catch (IOException ignored) {}
+        try { if (out != null) out.close(); } catch (IOException ignored) {}
         out = null;
+        file = null;
     }
 
     File getFile() { return file; }
+    File getDir()  { return dir;  }
+
+    // ---------- Rotation helpers ----------
+
+    private void rollToNextPart() {
+        close();
+        partIndex++;
+        file = new File(dir, baseName + String.format(Locale.US, "_p%02d.csv", partIndex));
+        try {
+            out = new BufferedWriter(new FileWriter(file, /*append*/ false));
+            if (!header.isEmpty()) {
+                out.write(header);
+                out.newLine();
+                out.flush();
+            }
+            Log.i(TAG, "Switched to: " + file.getAbsolutePath());
+        } catch (IOException e) {
+            Log.e(TAG, "CsvLogger.rollToNextPart error", e);
+            close();
+        }
+    }
+
+    // ---------- Storage utilities (for deciding N) ----------
+
+    /** Returns available bytes in the app's external files dir partition. */
+    static long availableBytes(Context ctx) {
+        File base = new File(ctx.getExternalFilesDir(null), ".");
+        StatFs fs = new StatFs(base.getAbsolutePath());
+        return fs.getAvailableBytes();
+    }
+
+    /** Returns total bytes of that partition. */
+    static long totalBytes(Context ctx) {
+        File base = new File(ctx.getExternalFilesDir(null), ".");
+        StatFs fs = new StatFs(base.getAbsolutePath());
+        return fs.getTotalBytes();
+    }
+
+    /** Human-readable bytes (e.g., 21.3 GB). */
+    static String human(long bytes) {
+        String[] units = {"B","KB","MB","GB","TB"};
+        double b = bytes;
+        int u = 0;
+        while (b >= 1024 && u < units.length-1) { b /= 1024; u++; }
+        return new DecimalFormat("#,##0.0").format(b) + " " + units[u];
+    }
 }

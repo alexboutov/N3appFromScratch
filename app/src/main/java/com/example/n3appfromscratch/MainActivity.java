@@ -19,7 +19,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
 
     private static final String TAG = "Nat3_Sensors";
     private static final String HEADER =
-            "t,dt,accX,accY,accZ,linX,linY,linZ,gyrX,gyrY,gyrZ,magX,magY,magZ";
+            "t,dt,accX,accY,accZ,linX,linY,linZ,dt_lin,gyrX,gyrY,gyrZ,magX,magY,magZ";
 
     private ActivityMainBinding binding;
     private SensorManager sm;
@@ -38,6 +38,10 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private float linX = Float.NaN, linY = Float.NaN, linZ = Float.NaN;   // linear acceleration
     private float gyrX = Float.NaN, gyrY = Float.NaN, gyrZ = Float.NaN;   // gyroscope
     private float magX = Float.NaN, magY = Float.NaN, magZ = Float.NaN;   // magnetometer
+
+    // Linear-accel timing (for dt_lin)
+    private long lastLinNs = -1L;
+    private double dtLinSec = 0.0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -70,18 +74,31 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 // START
                 isLogging = true;
                 lastTickSec = -1.0;
+
+                // Decide per-file limit N based on available space
+                long avail = CsvLogger.availableBytes(this);
+                long total = CsvLogger.totalBytes(this);
+                Log.i(TAG, "Storage available: " + CsvLogger.human(avail) + " / " + CsvLogger.human(total));
+
+                // Strategy: use the smaller of 50 MB or 10% of available space, but at least 5 MB
+                // long tenPercent = avail / 10;
+                // long limitBytes = Math.max(5L * 1024 * 1024, Math.min(50L * 1024 * 1024, tenPercent));
+                long limitBytes = 10L * 1024 * 1024; // 25 MB.
+                Log.i(TAG, "Using per-file limit: " + CsvLogger.human(limitBytes));
+
                 csv = new CsvLogger(this);
-                csv.start(HEADER);                // file header
-                Log.i(TAG, HEADER);               // optional: header to Logcat
+                csv.setMaxBytes(limitBytes);   // <-- rotation threshold
+                csv.start(HEADER);             // file header
+                Log.i(TAG, HEADER);            // optional: header to Logcat
                 binding.btnStartStop.setText("STOP");
                 Log.i(TAG, "# START" + (csv != null && csv.getFile()!=null
                         ? " file=" + csv.getFile().getAbsolutePath() : ""));
             } else {
                 // STOP
                 if (csv != null) {
-                    csv.stop(HEADER);             // repeat header in file
+                    csv.stop(HEADER);          // repeat header in file
                 }
-                Log.i(TAG, HEADER);               // optional: header to Logcat again
+                Log.i(TAG, HEADER);            // optional: header to Logcat again
                 isLogging = false;
                 binding.btnStartStop.setText("START");
                 Log.i(TAG, "# STOP" + (csv != null && csv.getFile()!=null
@@ -89,6 +106,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 csv = null;
             }
         });
+
     }
 
     @Override
@@ -128,6 +146,13 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 linX = event.values[0];
                 linY = event.values[1];
                 linZ = event.values[2];
+                // dt_lin: seconds between consecutive LIN events
+                if (lastLinNs > 0) {
+                    dtLinSec = (event.timestamp - lastLinNs) / 1_000_000_000.0;
+                } else {
+                    dtLinSec = 0.0;
+                }
+                lastLinNs = event.timestamp;
                 break;
             case Sensor.TYPE_GYROSCOPE:
                 gyrX = event.values[0];
@@ -151,17 +176,22 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             double dt = (lastTickSec > 0) ? (tSec - lastTickSec) : 0.0;
             lastTickSec = tSec;
 
-            // CSV: t,dt,ACC,LIN,GYR,MAG (14 columns)
+            // If no LIN sensor, keep dt_lin at 0.0
+            double dtLinOut = dtLinSec; // already in seconds; format with 5 decimals
+
+            // CSV: t,dt,ACC,LIN,dt_lin,GYR,MAG
             String row = String.format(
                     Locale.US,
-                    "%.6f,%.6f," +   // t, dt
-                            "%.3f,%.3f,%.3f," +   // ACC ax,ay,az
-                            "%.3f,%.3f,%.3f," +   // LIN ax,ay,az
-                            "%.5f,%.5f,%.5f," +   // GYR gx,gy,gz
-                            "%.1f,%.1f,%.1f",     // MAG mx,my,mz
+                    "%.6f,%.6f," +            // t, dt
+                            "%.3f,%.3f,%.3f," +      // ACC ax,ay,az
+                            "%.3f,%.3f,%.3f," +      // LIN ax,ay,az
+                            "%.5f," +                // dt_lin (s)
+                            "%.5f,%.5f,%.5f," +      // GYR gx,gy,gz
+                            "%.1f,%.1f,%.1f",        // MAG mx,my,mz
                     tSec, dt,
                     accX, accY, accZ,
                     linX, linY, linZ,
+                    dtLinOut,
                     gyrX, gyrY, gyrZ,
                     magX, magY, magZ
             );
