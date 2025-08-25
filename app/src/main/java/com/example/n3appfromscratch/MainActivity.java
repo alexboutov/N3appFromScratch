@@ -43,10 +43,9 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private final float[] R = new float[9];  // device -> world rotation (row-major)
     private volatile boolean hasR = false;
 
-    // Forward axis (world-frame) hardcoded: South = -Y (Android world: X=East, Y=North, Z=Up)
-    //    private static final float[] FWD_SOUTH = new float[]{0f, -1f, 0f};
-    // Forward axis (world-frame) hardcoded: East = +X (Android world: X=East, Y=North, Z=Up)
-    private static final float[] FWD_SOUTH = new float[]{1f, 0f, 0f};
+    // Forward axis captured at START (world-frame unit vector, derived from device +X at START)
+    private final float[] fwdW = new float[]{1f, 0f, 0f};
+    private boolean hasFwd = false;
 
     // ACC timing
     private long lastAccNs = -1L;
@@ -86,7 +85,11 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         accRaw = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
         gyro   = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
         mag    = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
-        rotVec = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR); // absolute heading; fine for South
+        // Prefer magnetometer-free orientation; fallback to absolute if needed
+        rotVec = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
+        if (rotVec == null) {
+            rotVec = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        }
 
         String info = "Sensors: "
                 + ((accRaw!=null)?"ACC ":"")
@@ -105,6 +108,9 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 lastAccNs = -1L;
                 lastAFwd = Double.NaN;
                 vFwd = 0.0;
+
+                // forward capture will occur on next rotation update
+                hasFwd = false;
 
                 // reset stats
                 rowsLogged = 0;
@@ -177,9 +183,19 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         final double tSec = event.timestamp / 1e9;
 
         switch (type) {
+            case Sensor.TYPE_GAME_ROTATION_VECTOR:
             case Sensor.TYPE_ROTATION_VECTOR:
                 SensorManager.getRotationMatrixFromVector(R, event.values);
                 hasR = true;
+                // Capture forward once right after START
+                if (isLogging && !hasFwd) {
+                    // device +X expressed in world frame (column 0 of R)
+                    fwdW[0] = R[0];  fwdW[1] = R[3];  fwdW[2] = R[6];
+                    normalize(fwdW);
+                    hasFwd = true;
+                    Log.i(TAG, String.format(Locale.US,
+                            "Forward captured (world): [%.3f, %.3f, %.3f]", fwdW[0], fwdW[1], fwdW[2]));
+                }
                 break;
 
             case Sensor.TYPE_ACCELEROMETER:
@@ -198,15 +214,15 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 }
                 lastAccNs = event.timestamp;
 
-                // compute aFwd using ACC->world - g, projected onto South
-                if (hasR) {
+                // compute aFwd using ACC->world - g, projected onto captured forward
+                if (hasR && hasFwd) {
                     mulR(aW, R, accX, accY, accZ);   // world accel incl. g
                     aWlin[0] = aW[0];
                     aWlin[1] = aW[1];
                     aWlin[2] = aW[2] - G;            // remove gravity (world Z up)
-                    aFwd = aWlin[0]*FWD_SOUTH[0] + aWlin[1]*FWD_SOUTH[1] + aWlin[2]*FWD_SOUTH[2];
+                    aFwd = aWlin[0]*fwdW[0] + aWlin[1]*fwdW[1] + aWlin[2]*fwdW[2];
                 } else {
-                    aFwd = Double.NaN;               // no orientation yet
+                    aFwd = Double.NaN;               // no orientation/forward yet
                 }
 
                 // integrate velocity (trapezoid) when we have a prior sample and dt>0
@@ -288,6 +304,11 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         out[0] = R[0]*x + R[1]*y + R[2]*z;
         out[1] = R[3]*x + R[4]*y + R[5]*z;
         out[2] = R[6]*x + R[7]*y + R[8]*z;
+    }
+
+    private static void normalize(float[] v) {
+        float n = (float)Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        if (n > 1e-6f) { v[0]/=n; v[1]/=n; v[2]/=n; }
     }
 
     private String[] buildStatsFooter() {
