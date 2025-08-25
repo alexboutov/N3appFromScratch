@@ -1,64 +1,62 @@
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
-cd /d "%~dp0"
 
-REM Args: pull_and_report.bat [file] [topN] [midN] [botN]
-set "REQFILE=%~1"
-set "TOP=%~2"
-set "MID=%~3"
-set "BOT=%~4"
-if not defined TOP set "TOP=10"
-if not defined MID set "MID=10"
-if not defined BOT set "BOT=20"
+REM === Settings ===
+set "PKG=com.example.n3appfromscratch"
+set "REMOTE_DIR=/sdcard/Android/data/%PKG%/files/logs"
 
-REM 1) Pull contents of remote logs into current folder (no nested logs)
-adb pull /sdcard/Android/data/com.example.n3appfromscratch/files/logs/. . >nul 2>&1
-
-REM 1a) If a nested .\logs\ appeared anyway, flatten it
-if exist ".\logs\run_*.csv" (
-  move /Y ".\logs\run_*.csv" "." >nul 2>&1
-  rmdir /S /Q ".\logs" >nul 2>&1
-)
-
-REM 2) Decide which file to show
-if defined REQFILE (
-  if exist "%REQFILE%" (
-    set "NEWEST=%REQFILE%"
-  ) else (
-    for /f "usebackq delims=" %%F in (`
-      powershell -NoProfile -Command ^
-        "(Get-ChildItem -File -Filter '%REQFILE%' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName"
-    `) do set "NEWEST=%%F"
+REM === 1) Pull remote CSVs into the current directory (no nested folder) ===
+for /f "delims=" %%F in ('adb shell ls -1 %REMOTE_DIR% 2^>nul') do (
+  echo %%F | findstr /r /c:"^run_.*\.csv$" >nul
+  if not errorlevel 1 (
+    adb pull "%REMOTE_DIR%/%%F" . >nul
   )
-) else (
-  for /f "usebackq delims=" %%F in (`
-    powershell -NoProfile -Command ^
-      "(Get-ChildItem -File -Filter 'run_*.csv' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName"
-  `) do set "NEWEST=%%F"
 )
 
-if not defined NEWEST (
-  echo No matching CSV files found.
+REM === 2) Pick newest by filename (lexicographic = chronological for your pattern) ===
+set "newest="
+for /f "delims=" %%F in ('dir /b /a-d run_*.csv ^| sort') do (
+  set "newest=%%F"
+)
+
+if not defined newest (
+  echo No run_*.csv files found in %cd%.
   exit /b 1
 )
 
-echo === NEWEST: %NEWEST%
+echo === NEWEST: %cd%\%newest%
 echo.
 
-REM 3) Top N
-echo --- TOP %TOP% ---
-powershell -NoProfile -Command "Get-Content -Path '%NEWEST%' -Head %TOP%"
-echo.
-
-REM 4) Middle N (centered)
-echo --- MIDDLE %MID% ---
+REM === 3) TOP 10 ===
+echo --- TOP 10 ---
 powershell -NoProfile -Command ^
-  "$f='%NEWEST%'; $n=(Get-Content -Path $f).Count; $w=%MID%; $s=[math]::Max([math]::Floor($n/2)-[math]::Floor($w/2),0); Get-Content -Path $f | Select-Object -Skip $s -First $w"
+  "Get-Content -Path '%newest%' -TotalCount 10 | ForEach-Object { $_ }"
 echo.
 
-REM 5) Bottom N
-echo --- BOTTOM %BOT% ---
-powershell -NoProfile -Command "Get-Content -Path '%NEWEST%' -Tail %BOT%"
+REM Count lines once for middle calc
+for /f "usebackq tokens=1" %%N in (`powershell -NoProfile -Command "(Get-Content -Path '%newest%').Count"`) do set COUNT=%%N
+if not defined COUNT set COUNT=0
+
+REM Choose middle window of 10 lines
+set /a midStart = COUNT/2 - 5
+if %midStart% lss 0 set midStart=0
+
+REM Clamp end (PowerShell slice will clamp, but we compute end for clarity)
+set /a midEnd = midStart + 9
+
+REM === 4) MIDDLE 10 ===
+echo --- MIDDLE 10 ---
+powershell -NoProfile -Command ^
+  "$c=Get-Content -Path '%newest%';" ^
+  "$s=[math]::Max(0,%midStart%);" ^
+  "$e=[math]::Min($s+9,$c.Count-1);" ^
+  "if ($c.Count -gt 0) { $c[$s..$e] | ForEach-Object { $_ } }"
+echo.
+
+REM === 5) BOTTOM 20 ===
+echo --- BOTTOM 20 ---
+powershell -NoProfile -Command ^
+  "Get-Content -Path '%newest%' | Select-Object -Last 20 | ForEach-Object { $_ }"
 echo.
 
 endlocal
