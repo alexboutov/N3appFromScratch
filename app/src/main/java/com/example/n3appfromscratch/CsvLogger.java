@@ -65,17 +65,24 @@ class CsvLogger {
         }
     }
 
-    /** Finish the run; append header again (per your requirement) and close. */
-    void stop(String finalHeader) {
-        if (out == null) return;
+    /** Finish by writing a header and optional footer lines, then close. */
+    void finishWithFooter(String headerLine, String[] footerLines) {
+        if (out == null) { close(); return; }
         try {
-            if (finalHeader != null && !finalHeader.isEmpty()) {
-                out.write(finalHeader);
+            if (headerLine != null && !headerLine.isEmpty()) {
+                out.write(headerLine);
                 out.newLine();
-                out.flush();
             }
+            if (footerLines != null) {
+                for (String s : footerLines) {
+                    if (s == null) continue;
+                    out.write(s);
+                    out.newLine();
+                }
+            }
+            out.flush();
         } catch (IOException e) {
-            Log.e(TAG, "CsvLogger.stop error", e);
+            Log.e(TAG, "CsvLogger.finishWithFooter error", e);
         } finally {
             close();
         }
