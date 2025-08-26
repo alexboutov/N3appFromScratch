@@ -65,17 +65,16 @@ class CsvLogger {
         }
     }
 
-    /** Finish by writing a header and optional footer lines, then close. */
-    void finishWithFooter(String headerLine, String[] footerLines) {
-        if (out == null) { close(); return; }
+    /** Finish the run; append header again + optional footer, then close. */
+    void finishWithFooter(String repeatHeader, String[] footerLines) {
+        if (out == null) return;
         try {
-            if (headerLine != null && !headerLine.isEmpty()) {
-                out.write(headerLine);
+            if (repeatHeader != null && !repeatHeader.isEmpty()) {
+                out.write(repeatHeader);
                 out.newLine();
             }
             if (footerLines != null) {
                 for (String s : footerLines) {
-                    if (s == null) continue;
                     out.write(s);
                     out.newLine();
                 }
@@ -117,23 +116,20 @@ class CsvLogger {
         }
     }
 
-    // ---------- Storage utilities (for deciding N) ----------
+    // ---------- Storage utilities ----------
 
-    /** Returns available bytes in the app's external files dir partition. */
     static long availableBytes(Context ctx) {
         File base = new File(ctx.getExternalFilesDir(null), ".");
         StatFs fs = new StatFs(base.getAbsolutePath());
         return fs.getAvailableBytes();
     }
 
-    /** Returns total bytes of that partition. */
     static long totalBytes(Context ctx) {
         File base = new File(ctx.getExternalFilesDir(null), ".");
         StatFs fs = new StatFs(base.getAbsolutePath());
         return fs.getTotalBytes();
     }
 
-    /** Human-readable bytes (e.g., 21.3 GB). */
     static String human(long bytes) {
         String[] units = {"B","KB","MB","GB","TB"};
         double b = bytes;

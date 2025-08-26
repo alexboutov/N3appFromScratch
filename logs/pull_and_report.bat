@@ -1,3 +1,4 @@
+adb pull /sdcard/Android/data/com.example.n3appfromscratch/files/logs ../.
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
 
