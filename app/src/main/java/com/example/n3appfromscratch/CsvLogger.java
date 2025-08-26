@@ -56,7 +56,6 @@ class CsvLogger {
         try {
             out.write(row);
             out.newLine();
-            // lightweight size check; rotate if needed
             if (file != null && file.length() >= maxBytes) {
                 rollToNextPart();
             }
@@ -97,7 +96,6 @@ class CsvLogger {
     File getDir()  { return dir;  }
 
     // ---------- Rotation helpers ----------
-
     private void rollToNextPart() {
         close();
         partIndex++;
@@ -117,7 +115,6 @@ class CsvLogger {
     }
 
     // ---------- Storage utilities ----------
-
     static long availableBytes(Context ctx) {
         File base = new File(ctx.getExternalFilesDir(null), ".");
         StatFs fs = new StatFs(base.getAbsolutePath());
