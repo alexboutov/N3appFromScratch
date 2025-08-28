@@ -21,18 +21,14 @@ import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity implements SensorEventListener {
 
-
     private static final String TAG = "Nat3_Sensors";
 
-    // Header includes yaw/gyroNorm/tilt + two accelerations (raw/corrected) and two velocities
-    //private static final String HEADER =
-            //"t,dt,accX,accY,accZ,gyrX,gyrY,gyrZ,magX,magY,magZ,yawDeg,gyroNorm,tiltDeg,aFwd_raw,aFwd,vFwd_raw,vFwd";
     private static final String HEADER =
             "t,dt,accX,accY,accZ,gyrX,gyrY,gyrZ,magX,magY,magZ,yawDeg,gyroNorm,tiltDeg,aFwd_raw,aFwd,vFwd_raw,vFwd,P";
 
     private ActivityMainBinding binding;
     private SensorManager sm;
-    private Sensor accRaw, gyro, mag, rotVec;
+    private Sensor accRaw, gyro, mag, rotVec, gravity, linAcc; // <-- added gravity & linAcc
 
     // Logging control
     private boolean isLogging = false;
@@ -121,6 +117,14 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private final ArrayList<Double> absACorrList = new ArrayList<>();
     private double t0Corr = Double.NaN, sumXCorr = 0.0, sumX2Corr = 0.0, sumYCorr = 0.0, sumXYCorr = 0.0;
 
+    // --- Legacy P logic state (from old NataDataCollect) ---
+    private final float[] latestGravity = new float[3];
+    private final float[] latestMag = new float[3];
+    private boolean hasGrav = false;
+    private boolean hasMag  = false;
+    private float latestP = Float.NaN;           // updated on LINEAR_ACCELERATION, logged on ACC
+    private static final float POOL_AZIMUTH_DEG = 0f; // due North
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -135,12 +139,16 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         gyro   = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
         mag    = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
         rotVec = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        gravity= sm.getDefaultSensor(Sensor.TYPE_GRAVITY);                 // added
+        linAcc = sm.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION);     // added
 
         String info = "Sensors: "
-                + ((accRaw!=null)?"ACC ":"")
-                + ((gyro  !=null)?"GYRO ":"")
-                + ((mag   !=null)?"MAG ":"")
-                + ((rotVec!=null)?"RV ":"");
+                + ((accRaw != null) ? "ACC "  : "")
+                + ((gyro   != null) ? "GYRO " : "")
+                + ((mag    != null) ? "MAG "  : "")
+                + ((rotVec != null) ? "RV "   : "")
+                + ((gravity!= null) ? "GRAV " : "")
+                + ((linAcc != null) ? "LA "   : "");
         binding.tvInfo.setText(info + "  HPF=0.20Hz (locked)");
 
         // START/STOP
@@ -186,6 +194,11 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 lastZuputTSec = -1.0;
                 zuptCount = 0;
 
+                // reset P state
+                latestP = Float.NaN;
+                hasGrav = false;
+                hasMag  = false;
+
                 long avail = CsvLogger.availableBytes(this);
                 long total = CsvLogger.totalBytes(this);
                 Log.i(TAG, "Storage available: " + CsvLogger.human(avail) + " / " + CsvLogger.human(total));
@@ -222,10 +235,12 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     protected void onResume() {
         super.onResume();
         int rate = SensorManager.SENSOR_DELAY_FASTEST; // maximize rate
-        if (rotVec != null) sm.registerListener(this, rotVec, rate);
-        if (accRaw != null) sm.registerListener(this, accRaw, rate);
-        if (gyro   != null) sm.registerListener(this, gyro,   rate);
-        if (mag    != null) sm.registerListener(this, mag,    rate);
+        if (rotVec  != null) sm.registerListener(this, rotVec,  rate);
+        if (accRaw  != null) sm.registerListener(this, accRaw,  rate);
+        if (gyro    != null) sm.registerListener(this, gyro,    rate);
+        if (mag     != null) sm.registerListener(this, mag,     rate);
+        if (gravity != null) sm.registerListener(this, gravity, rate);   // added
+        if (linAcc  != null) sm.registerListener(this, linAcc,  rate);   // added
         Log.i(TAG, "onResume (listeners registered, FASTEST)");
     }
 
@@ -245,8 +260,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
 
     @Override
     public void onSensorChanged(SensorEvent event) {
-        float P = 0.0099f;  // logged as column "P"
-        final int type = event.sensor.getType();
+        final int type = event.sensor.getType(); // keeping 'final' is fine
         final double tSec = event.timestamp / 1e9;
 
         switch (type) {
@@ -274,6 +288,23 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 double cz = R[8]; // world Z component of device Z (R*[0,0,1]) -> out[2]=R[8]
                 cz = Math.max(-1.0, Math.min(1.0, cz));
                 tiltDeg = Math.toDegrees(Math.acos(cz));
+                break;
+            }
+
+            case Sensor.TYPE_GRAVITY: { // <-- new: keep latest gravity for P
+                latestGravity[0] = event.values[0];
+                latestGravity[1] = event.values[1];
+                latestGravity[2] = event.values[2];
+                hasGrav = true;
+                break;
+            }
+
+            case Sensor.TYPE_LINEAR_ACCELERATION: { // <-- new: compute P here
+                if (hasGrav && hasMag) {
+                    latestP = NataDataCollect.computeP(latestGravity, latestMag, event.values, POOL_AZIMUTH_DEG);
+                } else {
+                    latestP = Float.NaN;
+                }
                 break;
             }
 
@@ -366,7 +397,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                     checkTurnZUPT(tSec);
                 }
 
-                // CSV row
+                // CSV row (use latestP from LINEAR_ACCELERATION path)
                 String row = String.format(
                         Locale.US,
                         "%.6f,%.6f," +            // t, dt
@@ -380,7 +411,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                         gyrX, gyrY, gyrZ,
                         magX, magY, magZ,
                         yawDeg, gyroNorm, tiltDeg,
-                        aFwdRaw, aFwd, vFwdRaw, vFwd, P
+                        aFwdRaw, aFwd, vFwdRaw, vFwd, latestP
                 );
 
                 if (csv != null) csv.log(row);
@@ -436,6 +467,10 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 magX = event.values[0];
                 magY = event.values[1];
                 magZ = event.values[2];
+                latestMag[0] = event.values[0];
+                latestMag[1] = event.values[1];
+                latestMag[2] = event.values[2];
+                hasMag = true;
                 break;
         }
     }
@@ -568,7 +603,6 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 meanACorr, stdACorr, meanAbsACorr, p95AbsCorr));
         lines.add(String.format(Locale.US, "# CORR aFwd_slope_vs_time=%.8f m/s^3", slopeCorr));
         lines.add(String.format(Locale.US, "# CORR vFwd_final=%.6f m/s", vFwd));
-      //  lines.add(String.format(Locale.US, "# Latest P =%.6f m/s", P));
 
         lines.add("# ---- STATS END ----");
         return lines.toArray(new String[0]);

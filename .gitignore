@@ -45,3 +45,4 @@ ehthumbs.db
 # ---- Prevent nested .gitignore from reappearing (optional) ----
 app/.gitignore
 .idea/.gitignore
+/logs/adb_pull.bat
