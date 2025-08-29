@@ -23,20 +23,32 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
 
     private static final String TAG = "Nat3_Sensors";
 
-    // Header includes "P" at the end (forward accel along pool azimuth)
-    private static final String HEADER =
-            "t,dt,accX,accY,accZ,gyrX,gyrY,gyrZ,magX,magY,magZ,yawDeg,gyroNorm,tiltDeg,aFwd_raw,aFwd,vFwd_raw,vFwd,P";
+    // ACC-file header (device-forward pipeline)
+    private static final String HEADER_ACC =
+            "tAcc,dtAcc,accX,accY,accZ,yawDeg,tiltDeg," +
+                    "aFwd_raw,aFwd,vFwd_raw,vFwd,distance_vFwd," +
+                    "FDU_degrees";
+
+    // LA-file header (azimuth-forward pipeline / legacy P)
+    private static final String HEADER_LA =
+            "tLa,dtLa,laX,laY,laZ,yawDeg,tiltDeg,azimuthDeg," +
+                    "P,vP,distance_vP," +
+                    "E_world,N_world,Z_world,azErrDeg";
 
     private ActivityMainBinding binding;
     private SensorManager sm;
     private Sensor accRaw, gyro, mag, rotVec, gravity, linAcc;
 
-    // Logging
-    private CsvLogger csv;
+    // Two independent CSV loggers (separate files, separate clocks)
+    private CsvLogger csvAcc = null;
+    private CsvLogger csvLa  = null;
 
-    // Motion pipeline (all logic/state lives here)
+    // Motion pipeline
     private MotionPipeline pipeline;
-    private final MotionConfig cfg = new MotionConfig(); // default: azimuth 0° (North)
+    private final MotionConfig cfg = new MotionConfig(); // default azimuth: 0° (North)
+
+    // Run state
+    private boolean isRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -58,35 +70,68 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         pipeline = new MotionPipeline(cfg);
 
         refreshInfoLabel();
+        showIdleVelocities(); // 0.00 m/s in both fields on app launch
 
-        // Tap the info line to set forward azimuth (degrees)
+        // Tap the info line to set forward azimuth (degrees) for LA pipeline
         binding.tvInfo.setOnClickListener(v -> showAzimuthDialog());
 
         // START/STOP button
         binding.btnStartStop.setOnClickListener(v -> {
-            if (csv == null) {
-                // START
+            if (!isRunning) {
+                // START both files + reset UI to 0.00 until first updates arrive
+                isRunning = true;
+                showLiveVelocities(0.0, 0.0); // show 0.00 immediately
+
                 long limitBytes = 10L * 1024 * 1024; // 10 MB per part
                 long avail = CsvLogger.availableBytes(this);
                 long total = CsvLogger.totalBytes(this);
                 Log.i(TAG, "Storage available: " + CsvLogger.human(avail) + " / " + CsvLogger.human(total));
-                Log.i(TAG, "Using per-file limit: " + CsvLogger.human(limitBytes));
+                Log.i(TAG, "Per-file limit: " + CsvLogger.human(limitBytes));
 
-                csv = new CsvLogger(this);
-                csv.setMaxBytes(limitBytes);
+                csvAcc = new CsvLogger(this);
+                csvAcc.setMaxBytes(limitBytes);
+                csvAcc.setNameSuffix("_acc");      // ACC file tag
+                csvAcc.start(HEADER_ACC);
 
-                pipeline.startLogging(csv, HEADER);  // pipeline starts CSV & logs header
+                csvLa = new CsvLogger(this);
+                csvLa.setMaxBytes(limitBytes);
+                csvLa.setNameSuffix("_la");        // LA file tag
+                csvLa.start(HEADER_LA);
+
+                pipeline.start(csvAcc, HEADER_ACC, csvLa, HEADER_LA);
                 binding.btnStartStop.setText("STOP");
-                Log.i(TAG, "# START" + (csv.getFile() != null ? " file=" + csv.getFile().getAbsolutePath() : ""));
-            } else {
-                // STOP
-                String[] footer = pipeline.stopAndGetFooter();
-                csv.finishWithFooter(HEADER, footer);
-                Log.i(TAG, HEADER);
-                for (String s : footer) Log.i(TAG, s);
 
-                Log.i(TAG, "# STOP" + (csv.getFile() != null ? " file=" + csv.getFile().getAbsolutePath() : ""));
-                csv = null;
+                Log.i(TAG, "# START ACC" + (csvAcc.getFile()!=null ? " file=" + csvAcc.getFile().getAbsolutePath() : ""));
+                Log.i(TAG, "# START LA " + (csvLa .getFile()!=null ? " file=" + csvLa .getFile().getAbsolutePath() : ""));
+            } else {
+                // STOP both, finalize files
+                isRunning = false;
+
+                String[] footerAcc = pipeline.buildAccFooter();
+                String[] footerLa  = pipeline.buildLaFooter();
+
+                if (csvAcc != null) {
+                    csvAcc.finishWithFooter(HEADER_ACC, footerAcc);
+                    Log.i(TAG, HEADER_ACC);
+                    for (String s : footerAcc) Log.i(TAG, s);
+                    Log.i(TAG, "# STOP ACC" + (csvAcc.getFile()!=null ? " file=" + csvAcc.getFile().getAbsolutePath() : ""));
+                }
+                if (csvLa != null) {
+                    csvLa.finishWithFooter(HEADER_LA, footerLa);
+                    Log.i(TAG, HEADER_LA);
+                    for (String s : footerLa) Log.i(TAG, s);
+                    Log.i(TAG, "# STOP LA " + (csvLa.getFile()!=null ? " file=" + csvLa.getFile().getAbsolutePath() : ""));
+                }
+
+                csvAcc = null;
+                csvLa  = null;
+
+                // Freeze display at averages of just-completed swim
+                double avgAcc = pipeline.getAccAvgVel();
+                double avgLa  = pipeline.getLaAvgVel();
+                showAverages(avgAcc, avgLa);
+
+                pipeline.stop(); // reset internal flags AFTER we read averages
                 binding.btnStartStop.setText("START");
             }
         });
@@ -100,7 +145,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 + ((rotVec != null) ? "RV "   : "")
                 + ((gravity!= null) ? "GRAV " : "")
                 + ((linAcc != null) ? "LA "   : "");
-        info += String.format(Locale.US, "  HPF=%.2f Hz  Az=%d°",
+        info += String.format(Locale.US, "  HPF=%.2f Hz  Az=%d° (LA)",
                 cfg.HPF_FC_HZ, Math.round(cfg.poolAzimuthDeg));
         binding.tvInfo.setText(info);
     }
@@ -113,12 +158,11 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
 
         new AlertDialog.Builder(this)
                 .setTitle("Set Pool Azimuth (deg)")
-                .setMessage("0° = North, 90° = East, 180° = South, 270° = West")
+                .setMessage("0°=North, 90°=East, 180°=South, 270°=West")
                 .setView(input)
                 .setPositiveButton("OK", (d, w) -> {
                     try {
                         int val = Integer.parseInt(input.getText().toString().trim());
-                        // Normalize to [0,360)
                         int norm = ((val % 360) + 360) % 360;
                         pipeline.setPoolAzimuthDeg(norm);
                         refreshInfoLabel();
@@ -145,13 +189,23 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     protected void onPause() {
         super.onPause();
         sm.unregisterListener(this);
-        if (csv != null) {
-            // finalize logging to avoid a dangling file
-            String[] footer = pipeline.stopAndGetFooter();
-            csv.finishWithFooter(HEADER, footer);
-            csv = null;
+
+        // If paused while logging, finalize both files and freeze display at current averages
+        if (csvAcc != null || csvLa != null) {
+            isRunning = false;
+            String[] footerAcc = pipeline.buildAccFooter();
+            String[] footerLa  = pipeline.buildLaFooter();
+            if (csvAcc != null) csvAcc.finishWithFooter(HEADER_ACC, footerAcc);
+            if (csvLa  != null) csvLa.finishWithFooter(HEADER_LA,  footerLa);
+
+            double avgAcc = pipeline.getAccAvgVel();
+            double avgLa  = pipeline.getLaAvgVel();
+            showAverages(avgAcc, avgLa);
+
+            csvAcc = null; csvLa = null;
+            pipeline.stop();
+            binding.btnStartStop.setText("START");
         }
-        binding.btnStartStop.setText("START");
         Log.i(TAG, "onPause -> unregister");
     }
 
@@ -159,11 +213,36 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     public void onSensorChanged(SensorEvent event) {
         pipeline.handleEvent(event);
 
-        // Update the velocity text when ACC events come in (fast, steady cadence)
-        if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
-            binding.tvVelocity.setText(String.format(Locale.US, "%.2f m/s", pipeline.getUiVelocity()));
+        // Only update live display while RUNNING
+        if (isRunning) {
+            double vAcc = pipeline.getUiVelocityAcc();
+            double vLa  = pipeline.getUiVelocityLa();
+            showLiveVelocities(vAcc, vLa);
         }
     }
 
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
+
+    // ---------- UI helpers ----------
+
+    private void showIdleVelocities() {
+        binding.tvVelocity.setText(String.format(Locale.US, "ACC 0.00 m/s"));
+        if (binding.tvVelocityLa != null) {
+            binding.tvVelocityLa.setText(String.format(Locale.US, "LA  0.00 m/s"));
+        }
+    }
+
+    private void showLiveVelocities(double vAcc, double vLa) {
+        binding.tvVelocity.setText(String.format(Locale.US, "ACC %.2f m/s", vAcc));
+        if (binding.tvVelocityLa != null) {
+            binding.tvVelocityLa.setText(String.format(Locale.US, "LA  %.2f m/s", vLa));
+        }
+    }
+
+    private void showAverages(double avgAcc, double avgLa) {
+        binding.tvVelocity.setText(String.format(Locale.US, "ACC avg %.2f m/s", avgAcc));
+        if (binding.tvVelocityLa != null) {
+            binding.tvVelocityLa.setText(String.format(Locale.US, "LA  avg %.2f m/s", avgLa));
+        }
+    }
 }

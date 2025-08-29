@@ -5,156 +5,218 @@ import android.hardware.SensorEvent;
 import android.hardware.SensorManager;
 import android.util.Log;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Deque;
 import java.util.Locale;
 
 /**
- * Encapsulates all sensor fusion, biasing, filtering, ZUPT, "P" computation, and CSV logging.
- * Activity is now a thin wrapper that forwards SensorEvents and renders the UI text.
+ * Two independent pipelines + logs:
+ *  A) ACC (device-forward) -> dt from ACC, logs to csvAcc
+ *  B) LA  (azimuth-forward/"P") -> dt from LA, logs to csvLa
+ * No mixing, no alignment, no interpolation.
+ *
+ * Changes in this drop-in:
+ *  - LA rotation now prefers ROTATION_VECTOR (RV) and falls back to GRAV+MAG.
+ *  - LA rows include azErrDeg (desired azimuth - world azimuth from E/N), wrapped to [-180,180].
+ *  - LA sign is defined so motion TOWARD azimuth is positive.
+ *  - LA integration uses proper trapezoids (acc->vel, then vel->dist).
  */
 public class MotionPipeline {
 
     private static final String TAG = "MotionPipeline";
     private static final float  G   = 9.80665f; // m/s^2
 
-    // CSV
-    private CsvLogger csv;
-    private boolean isLogging = false;
-    private String header;
-
-    // Config (user-tunable)
+    // Config
     private final MotionConfig cfg;
 
-    // Orientation
-    private final float[] R = new float[9];     // device->world (row-major)
-    private final float[] E = new float[3];     // azimuth, pitch, roll (radians)
-    private boolean hasR = false;
+    // === CSVs (separate files) ===
+    private CsvLogger csvAcc = null;
+    private CsvLogger csvLa  = null;
 
-    private double yawDeg = Double.NaN;         // [-180..180]
-    private double yawUnwrapped = Double.NaN;
-    private double lastYawDeg = Double.NaN;
+    // === Orientation caches ===
+    private final float[] R_rv = new float[9];
+    private final float[] E_rv = new float[3];
+    private boolean hasRv = false;
+    private double yawDeg = Double.NaN;
     private double tiltDeg = Double.NaN;
 
-    // Forward vector capture (device +X mapped into world on START)
-    private boolean fwdCaptured = false;
-    private final float[] FWD_WORLD = new float[]{1f, 0f, 0f};
+    private final float[] R_gm = new float[9];
+    private final float[] I_gm = new float[9];
+    private final float[] latestGravity = new float[3];
+    private final float[] latestMag     = new float[3];
+    private boolean hasGrav = false, hasMag = false;
 
-    // Latest raw sensors (device frame)
+    // === Latest raw sensors (device frame) ===
     private float accX = Float.NaN, accY = Float.NaN, accZ = Float.NaN;
-    private float gyrX = Float.NaN, gyrY = Float.NaN, gyrZ = Float.NaN;
-    private float magX = Float.NaN, magY = Float.NaN, magZ = Float.NaN;
+    private float laX  = Float.NaN, laY  = Float.NaN, laZ  = Float.NaN;
 
-    // Timing (ACC based)
-    private long lastAccNs = -1L;
+    // === ACC pipeline (A): device-forward ===
+    private long   lastAccNs = -1L;
+    private final float[] aW = new float[3];      // world accel incl. g
+    private final float[] aWlin = new float[3];   // world minus g
+    private final float[] FWD_WORLD = new float[]{1f,0f,0f};
+    private boolean fwdCaptured = false;
+    private double  fwdAzDeg = Double.NaN;        // FDU, degrees
 
-    // World-frame accelerations
-    private final float[] aW    = new float[3]; // incl. g
-    private final float[] aWlin = new float[3]; // minus g
-
-    // Forward accel & velocity
     private double aFwdRaw = Double.NaN;
-    private double aFwd = Double.NaN;          // bias-corrected (pre-HPF)
-    private double aFwdHPF = Double.NaN;       // for UI velocity integration
-    private double lastAFwdRaw = Double.NaN;
-    private double lastAFwd = Double.NaN;
-    private double lastAFwdHPF = Double.NaN;
+    private double aFwd = Double.NaN;
     private double vFwdRaw = 0.0;
     private double vFwd = 0.0;
+    private double lastAFwdRaw = Double.NaN;
+    private double lastAFwd = Double.NaN;
+    private double lastVfwd = Double.NaN;
+    private double distance_vFwd = 0.0;
 
-    // Bias calibration (mean over first window, then frozen)
-    private boolean calibrating = false;
-    private long calibStartNs = -1L;
-    private double sumBias = 0.0;
-    private long nBias = 0L;
-    private double aBias = 0.0;
+    // Simple bias (freeze after window) for ACC forward
+    private boolean calibratingAcc = false;
+    private long calibStartAccNs = -1L;
+    private double sumBiasAcc = 0.0;
+    private long nBiasAcc = 0L;
+    private double aBiasAcc = 0.0;
 
-    // HPF
-    private OnePoleHPF hpf;
+    // ACC stats for footer/averages
+    private long   rowsAcc = 0;
+    private double firstAccTSec = Double.NaN, lastAccTSec = Double.NaN;
+    private double sumDtAcc = 0.0, minDtAcc = Double.POSITIVE_INFINITY, maxDtAcc = 0.0, nDtAcc = 0.0;
 
-    // ZUPT (turn-span)
-    private static final class YawSample {
-        final double t, yawDegUnwrapped, tiltDeg;
-        YawSample(double t, double yaw, double tiltDeg) { this.t = t; this.yawDegUnwrapped = yaw; this.tiltDeg = tiltDeg; }
-    }
-    private final Deque<YawSample> yawBuf = new ArrayDeque<>();
-    private static final int TURN_BUF_MAX = 512;
-    private double lastZuputTSec = -1.0;
-    private int zuptCount = 0;
+    // === LA pipeline (B): azimuth-forward / legacy P ===
+    private long   lastLaNs = -1L;
+    private float  P = Float.NaN;            // m/s^2 (projection of world LA onto azimuth)
+    private double vP = 0.0;                 // m/s
+    private double lastVP = Double.NaN;
+    private double distance_vP = 0.0;        // m
+    private double lastP_LA = Double.NaN;    // previous P for trapezoid
 
-    // Stats (for footer)
-    private long rowsLogged = 0;
-    private double firstTSec = Double.NaN, lastTSec = Double.NaN;
-    private double sumDt = 0.0, minDt = Double.POSITIVE_INFINITY, maxDt = 0.0, nDt = 0.0;
+    // LA extras (world components for transparency)
+    private float  E_world = Float.NaN, N_world = Float.NaN, Z_world = Float.NaN;
 
-    // stats for raw/corrected
-    private long nARaw = 0, nACorr = 0;
-    private double sumARaw = 0.0, sumA2Raw = 0.0, sumAbsARaw = 0.0;
-    private double sumACorr = 0.0, sumA2Corr = 0.0, sumAbsACorr = 0.0;
-    private final ArrayList<Double> absARawList = new ArrayList<>();
-    private final ArrayList<Double> absACorrList = new ArrayList<>();
-    private double t0Raw = Double.NaN, sumXRaw = 0.0, sumX2Raw = 0.0, sumYRaw = 0.0, sumXYRaw = 0.0;
-    private double t0Corr = Double.NaN, sumXCorr = 0.0, sumX2Corr = 0.0, sumYCorr = 0.0, sumXYCorr = 0.0;
-
-    // --- Legacy "P" logic inputs/state (GRAVITY + MAG + LINEAR_ACCELERATION) ---
-    private final float[] latestGravity = new float[3];
-    private final float[] latestMag = new float[3];
-    private boolean hasGrav = false;
-    private boolean hasMag  = false;
-    private float latestP = Float.NaN; // updated on LINEAR_ACCELERATION and logged with ACC row
+    // LA stats for footer/averages
+    private long   rowsLa = 0;
+    private double firstLaTSec = Double.NaN, lastLaTSec = Double.NaN;
+    private double sumDtLa = 0.0, minDtLa = Double.POSITIVE_INFINITY, maxDtLa = 0.0, nDtLa = 0.0;
 
     public MotionPipeline(MotionConfig config) {
-        this.cfg = config != null ? config : new MotionConfig();
-        this.hpf = new OnePoleHPF(this.cfg.HPF_FC_HZ);
+        this.cfg = (config != null) ? config : new MotionConfig();
     }
 
-    /** Start logging with a given CsvLogger and CSV header. */
-    public void startLogging(CsvLogger csv, String header) {
-        this.csv = csv;
-        this.header = header;
-        if (this.csv != null && this.header != null) {
-            this.csv.start(this.header);
-            Log.i(TAG, this.header);
-        }
-        resetForStart();
-        isLogging = true;
+    // ------------ lifecycle ------------
+
+    public void start(CsvLogger csvAcc, String headerAcc, CsvLogger csvLa, String headerLa) {
+        this.csvAcc = csvAcc;
+        this.csvLa  = csvLa;
+        resetAll();
+        // headers already written in MainActivity
     }
 
-    /** Stop, return stats footer lines, and detach the logger. */
-    public String[] stopAndGetFooter() {
-        String[] footer = buildStatsFooter();
-        isLogging = false;
-        this.csv = null; // Activity will finish CSV with footer
-        return footer;
+    public void stop() {
+        resetAll();
+        this.csvAcc = null;
+        this.csvLa  = null;
     }
 
-    /** Handle any SensorEvent; logs rows inside ACC branch. */
+    private void resetAll() {
+        // Orientation
+        hasRv = false; yawDeg = Double.NaN; tiltDeg = Double.NaN;
+        hasGrav = hasMag = false;
+
+        // ACC pipeline
+        lastAccNs = -1L;
+        fwdCaptured = false;
+        fwdAzDeg = Double.NaN;
+        aFwdRaw = aFwd = Double.NaN;
+        vFwdRaw = vFwd = 0.0;
+        lastAFwdRaw = lastAFwd = lastVfwd = Double.NaN;
+        distance_vFwd = 0.0;
+        calibratingAcc = true; calibStartAccNs = -1L;
+        sumBiasAcc = 0.0; nBiasAcc = 0L; aBiasAcc = 0.0;
+        rowsAcc = 0; firstAccTSec = Double.NaN; lastAccTSec = Double.NaN;
+        sumDtAcc = 0.0; minDtAcc = Double.POSITIVE_INFINITY; maxDtAcc = 0.0; nDtAcc = 0.0;
+
+        // LA pipeline
+        lastLaNs = -1L;
+        P = Float.NaN; vP = 0.0; lastVP = Double.NaN; distance_vP = 0.0;
+        lastP_LA = Double.NaN;
+        E_world = N_world = Z_world = Float.NaN;
+        rowsLa = 0; firstLaTSec = Double.NaN; lastLaTSec = Double.NaN;
+        sumDtLa = 0.0; minDtLa = Double.POSITIVE_INFINITY; maxDtLa = 0.0; nDtLa = 0.0;
+    }
+
+    // ------------ azimuth API (LA pipeline only) ------------
+
+    /** Set lane azimuth in degrees (0=North, 90=East, 180=South, 270=West). */
+    public void setPoolAzimuthDeg(float deg) {
+        float norm = (float)(((double)deg % 360.0 + 360.0) % 360.0);
+        cfg.poolAzimuthDeg = norm;
+        Log.i(TAG, "POOL_AZIMUTH_DEG set to " + cfg.poolAzimuthDeg + "° (LA pipeline)");
+    }
+    public float getPoolAzimuthDeg() { return cfg.poolAzimuthDeg; }
+
+    // ------------ getters for UI ------------
+
+    /** Instantaneous velocity (ACC pipeline), m/s */
+    public double getUiVelocityAcc() { return vFwd; }
+
+    /** Instantaneous velocity (LA pipeline), m/s */
+    public double getUiVelocityLa() { return vP; }
+
+    /** Average velocity over the completed run (ACC): distance / duration, m/s */
+    public double getAccAvgVel() {
+        double dur = (!Double.isNaN(firstAccTSec) && !Double.isNaN(lastAccTSec))
+                ? (lastAccTSec - firstAccTSec) : 0.0;
+        if (dur <= 0.0) return 0.0;
+        return distance_vFwd / dur;
+    }
+
+    /** Average velocity over the completed run (LA): distance / duration, m/s */
+    public double getLaAvgVel() {
+        double dur = (!Double.isNaN(firstLaTSec) && !Double.isNaN(lastLaTSec))
+                ? (lastLaTSec - firstLaTSec) : 0.0;
+        if (dur <= 0.0) return 0.0;
+        return distance_vP / dur;
+    }
+
+    // ------------ footers ------------
+
+    public String[] buildAccFooter() {
+        ArrayList<String> lines = new ArrayList<>();
+        lines.add("# ---- ACC PIPELINE STATS ----");
+        lines.add(String.format(Locale.US, "# rows=%d", rowsAcc));
+        double duration = (!Double.isNaN(firstAccTSec) && !Double.isNaN(lastAccTSec)) ? (lastAccTSec - firstAccTSec) : 0.0;
+        double avgDt = (nDtAcc > 0) ? (sumDtAcc / nDtAcc) : 0.0;
+        double hz = (avgDt > 0) ? (1.0 / avgDt) : 0.0;
+        lines.add(String.format(Locale.US, "# duration_s=%.6f  dt_avg_s=%.6f dt_min_s=%.6f dt_max_s=%.6f approx_Hz=%.2f",
+                duration, avgDt, (Double.isInfinite(minDtAcc)?0.0:minDtAcc), maxDtAcc, hz));
+        lines.add(String.format(Locale.US, "# aBiasAcc=%.6f", aBiasAcc));
+        lines.add(String.format(Locale.US, "# FDU_degrees=%.1f", fwdAzDeg));
+        lines.add(String.format(Locale.US, "# FINAL distance_vFwd=%.3f m", distance_vFwd));
+        return lines.toArray(new String[0]);
+    }
+
+    public String[] buildLaFooter() {
+        ArrayList<String> lines = new ArrayList<>();
+        lines.add("# ---- LA PIPELINE STATS ----");
+        lines.add(String.format(Locale.US, "# rows=%d", rowsLa));
+        double duration = (!Double.isNaN(firstLaTSec) && !Double.isNaN(lastLaTSec)) ? (lastLaTSec - firstLaTSec) : 0.0;
+        double avgDt = (nDtLa > 0) ? (sumDtLa / nDtLa) : 0.0;
+        double hz = (avgDt > 0) ? (1.0 / avgDt) : 0.0;
+        lines.add(String.format(Locale.US, "# duration_s=%.6f  dt_avg_s=%.6f dt_min_s=%.6f dt_max_s=%.6f approx_Hz=%.2f",
+                duration, avgDt, (Double.isInfinite(minDtLa)?0.0:minDtLa), maxDtLa, hz));
+        lines.add(String.format(Locale.US, "# azimuthDeg=%.1f", (double)cfg.poolAzimuthDeg));
+        lines.add(String.format(Locale.US, "# FINAL distance_vP=%.3f m", distance_vP));
+        return lines.toArray(new String[0]);
+    }
+
+    // ------------ core event handler ------------
+
     public void handleEvent(SensorEvent event) {
         final int type = event.sensor.getType();
-        final double tSec = event.timestamp / 1e9;
 
         switch (type) {
             case Sensor.TYPE_ROTATION_VECTOR: {
-                SensorManager.getRotationMatrixFromVector(R, event.values);
-                hasR = true;
-
-                SensorManager.getOrientation(R, E);
-                double yawNow = Math.toDegrees(E[0]);
-                yawDeg = yawNow;
-
-                if (Double.isNaN(yawUnwrapped)) {
-                    yawUnwrapped = yawDeg;
-                } else {
-                    double dy = yawDeg - lastYawDeg;
-                    if (dy > 180) dy -= 360;
-                    else if (dy < -180) dy += 360;
-                    yawUnwrapped += dy;
-                }
-                lastYawDeg = yawDeg;
-
-                double cz = clamp(R[8], -1.0, 1.0);
+                SensorManager.getRotationMatrixFromVector(R_rv, event.values);
+                hasRv = true;
+                SensorManager.getOrientation(R_rv, E_rv);
+                yawDeg = Math.toDegrees(E_rv[0]);
+                double cz = clamp(R_rv[8], -1.0, 1.0);
                 tiltDeg = Math.toDegrees(Math.acos(cz));
                 break;
             }
@@ -167,283 +229,222 @@ public class MotionPipeline {
                 break;
             }
 
-            case Sensor.TYPE_LINEAR_ACCELERATION: {
-                if (hasGrav && hasMag) {
-                    latestP = NataDataCollect.computeP(latestGravity, latestMag, event.values, cfg.poolAzimuthDeg);
-                } else {
-                    latestP = Float.NaN;
-                }
-                break;
-            }
-
-            case Sensor.TYPE_GYROSCOPE: {
-                gyrX = event.values[0];
-                gyrY = event.values[1];
-                gyrZ = event.values[2];
-                break;
-            }
-
             case Sensor.TYPE_MAGNETIC_FIELD: {
-                magX = event.values[0];
-                magY = event.values[1];
-                magZ = event.values[2];
-                latestMag[0] = magX;
-                latestMag[1] = magY;
-                latestMag[2] = magZ;
+                latestMag[0] = event.values[0];
+                latestMag[1] = event.values[1];
+                latestMag[2] = event.values[2];
                 hasMag = true;
                 break;
             }
 
             case Sensor.TYPE_ACCELEROMETER: {
+                // --------- ACC PIPELINE (A) ---------
                 accX = event.values[0];
                 accY = event.values[1];
                 accZ = event.values[2];
 
-                if (!isLogging) break;
-
-                // dt (ACC clock)
-                double dtSec;
-                if (lastAccNs > 0) dtSec = (event.timestamp - lastAccNs) / 1_000_000_000.0;
-                else dtSec = 0.0;
-                if (calibrating && calibStartNs < 0L) calibStartNs = event.timestamp;
+                double tAcc = event.timestamp / 1e9;
+                double dtAcc;
+                if (lastAccNs > 0) dtAcc = (event.timestamp - lastAccNs) / 1_000_000_000.0;
+                else dtAcc = 0.0;
+                if (calibratingAcc && calibStartAccNs < 0L) calibStartAccNs = event.timestamp;
                 lastAccNs = event.timestamp;
 
-                // one-time forward vector capture when R is available
-                if (!fwdCaptured && hasR) {
-                    FWD_WORLD[0] = R[0];
-                    FWD_WORLD[1] = R[3];
-                    FWD_WORLD[2] = R[6];
+                // World rotation: prefer GM (gravity+mag) for world axes, fallback to RV
+                boolean haveGM = hasGrav && hasMag && SensorManager.getRotationMatrix(R_gm, I_gm, latestGravity, latestMag);
+                float[] R = haveGM ? R_gm : (hasRv ? R_rv : null);
+                if (R == null) {
+                    logAccRow(tAcc, dtAcc, Double.isNaN(yawDeg) ? Double.NaN : yawDeg,
+                            Double.isNaN(tiltDeg) ? Double.NaN : tiltDeg,
+                            Double.NaN);
+                    break;
+                }
+
+                // One-time capture of device-forward in world
+                if (!fwdCaptured) {
+                    FWD_WORLD[0] = R[0]; // world E component of device +X
+                    FWD_WORLD[1] = R[3]; // world N component of device +X
+                    FWD_WORLD[2] = R[6]; // world Z component of device +X
                     normalize3(FWD_WORLD);
-                    Log.i(TAG, String.format(Locale.US, "FWD captured(world): [%.4f, %.4f, %.4f]",
-                            FWD_WORLD[0], FWD_WORLD[1], FWD_WORLD[2]));
+                    fwdAzDeg = Math.toDegrees(Math.atan2(FWD_WORLD[0], FWD_WORLD[1])); // atan2(E, N)
+                    if (fwdAzDeg < 0) fwdAzDeg += 360.0;
+                    Log.i(TAG, String.format(Locale.US,
+                            "FWD captured(world): [%.4f, %.4f, %.4f]  az=%.1f°",
+                            FWD_WORLD[0], FWD_WORLD[1], FWD_WORLD[2], fwdAzDeg));
                     fwdCaptured = true;
                 }
 
-                // world linear accel
-                if (hasR && fwdCaptured) {
-                    mulR(aW, R, accX, accY, accZ);
-                    aWlin[0] = aW[0];
-                    aWlin[1] = aW[1];
-                    aWlin[2] = aW[2] - G;
+                // World linear acceleration from ACC
+                mulR(aW, R, accX, accY, accZ);
+                aWlin[0] = aW[0];
+                aWlin[1] = aW[1];
+                aWlin[2] = aW[2] - G;
 
-                    aFwdRaw = aWlin[0] * FWD_WORLD[0] + aWlin[1] * FWD_WORLD[1] + aWlin[2] * FWD_WORLD[2];
-                } else {
-                    aFwdRaw = Double.NaN;
-                }
+                // Projection onto device-forward axis
+                aFwdRaw = aWlin[0]*FWD_WORLD[0] + aWlin[1]*FWD_WORLD[1] + aWlin[2]*FWD_WORLD[2];
 
-                // bias calibration
-                if (calibrating && !Double.isNaN(aFwdRaw)) {
-                    sumBias += aFwdRaw;
-                    nBias++;
-                    double elapsed = (event.timestamp - calibStartNs) / 1_000_000_000.0;
+                // Bias (freeze after window)
+                if (calibratingAcc && !Double.isNaN(aFwdRaw)) {
+                    sumBiasAcc += aFwdRaw; nBiasAcc++;
+                    double elapsed = (event.timestamp - calibStartAccNs) / 1e9;
                     if (elapsed >= cfg.CAL_WINDOW_S) {
-                        aBias = (nBias > 0) ? (sumBias / nBias) : 0.0;
-                        calibrating = false;
-                        Log.i(TAG, String.format(Locale.US, "Bias frozen: aBias=%.6f (n=%d, %.2fs)", aBias, nBias, elapsed));
+                        aBiasAcc = (nBiasAcc > 0) ? (sumBiasAcc / nBiasAcc) : 0.0;
+                        calibratingAcc = false;
+                        Log.i(TAG, String.format(Locale.US,
+                                "ACC bias frozen: aBiasAcc=%.6f (n=%d, %.2fs)",
+                                aBiasAcc, nBiasAcc, elapsed));
                     }
                 }
-
-                // corrected accel
-                double biasNow = (!calibrating) ? aBias : (nBias > 0 ? (sumBias / nBias) : 0.0);
+                double biasNow = (!calibratingAcc) ? aBiasAcc : (nBiasAcc > 0 ? (sumBiasAcc / nBiasAcc) : 0.0);
                 aFwd = (!Double.isNaN(aFwdRaw)) ? (aFwdRaw - biasNow) : Double.NaN;
 
-                // HPF + integrate
-                aFwdHPF = (!Double.isNaN(aFwd)) ? hpf.filter(aFwd, dtSec) : Double.NaN;
+                // Integrations (trapezoid)
+                if (!Double.isNaN(aFwdRaw) && !Double.isNaN(lastAFwdRaw) && dtAcc > 0)
+                    vFwdRaw += 0.5 * (aFwdRaw + lastAFwdRaw) * dtAcc;
+                if (!Double.isNaN(aFwd) && !Double.isNaN(lastAFwd) && dtAcc > 0)
+                    vFwd += 0.5 * (aFwd + lastAFwd) * dtAcc;
+                if (!Double.isNaN(vFwd) && !Double.isNaN(lastVfwd) && dtAcc > 0)
+                    distance_vFwd += 0.5 * (vFwd + lastVfwd) * dtAcc;
 
-                if (!Double.isNaN(aFwdRaw) && !Double.isNaN(lastAFwdRaw) && dtSec > 0)
-                    vFwdRaw += 0.5 * (aFwdRaw + lastAFwdRaw) * dtSec;
-                if (!Double.isNaN(aFwdHPF) && !Double.isNaN(lastAFwdHPF) && dtSec > 0)
-                    vFwd += 0.5 * (aFwdHPF + lastAFwdHPF) * dtSec;
+                if (!Double.isNaN(aFwdRaw)) lastAFwdRaw = aFwdRaw;
+                if (!Double.isNaN(aFwd))    lastAFwd    = aFwd;
+                if (!Double.isNaN(vFwd))    lastVfwd    = vFwd;
 
-                if (!Double.isNaN(aFwdRaw))  lastAFwdRaw  = aFwdRaw;
-                if (!Double.isNaN(aFwd))     lastAFwd     = aFwd;
-                if (!Double.isNaN(aFwdHPF))  lastAFwdHPF  = aFwdHPF;
+                // Log ACC row
+                logAccRow(tAcc, dtAcc, yawDeg, tiltDeg, fwdAzDeg);
 
-                // ZUPT turn detector
-                if (!Double.isNaN(yawUnwrapped)) {
-                    yawBuf.addLast(new YawSample(tSec, yawUnwrapped, tiltDeg));
-                    if (yawBuf.size() > TURN_BUF_MAX) yawBuf.removeFirst();
-                    while (!yawBuf.isEmpty() && (tSec - yawBuf.peekFirst().t) > cfg.TURN_WINDOW_S) {
-                        yawBuf.removeFirst();
-                    }
-                    checkTurnZUPT(tSec);
+                // dt stats
+                if (Double.isNaN(firstAccTSec)) firstAccTSec = tAcc;
+                lastAccTSec = tAcc;
+                if (dtAcc > 0) {
+                    sumDtAcc += dtAcc; nDtAcc += 1.0;
+                    if (dtAcc < minDtAcc) minDtAcc = dtAcc;
+                    if (dtAcc > maxDtAcc) maxDtAcc = dtAcc;
+                }
+                break;
+            }
+
+            case Sensor.TYPE_LINEAR_ACCELERATION: {
+                // --------- LA PIPELINE (B) ---------
+                laX = event.values[0];
+                laY = event.values[1];
+                laZ = event.values[2];
+
+                double tLa = event.timestamp / 1e9;
+                double dtLa;
+                if (lastLaNs > 0) dtLa = (event.timestamp - lastLaNs) / 1_000_000_000.0;
+                else dtLa = 0.0;
+                lastLaNs = event.timestamp;
+
+                // Choose rotation source for LA: prefer RV, fallback to GRAV+MAG
+                float[] Rused = null;
+                if (hasRv) {
+                    Rused = R_rv;
+                } else if (hasGrav && hasMag && SensorManager.getRotationMatrix(R_gm, I_gm, latestGravity, latestMag)) {
+                    Rused = R_gm;
                 }
 
-                // Log row
-                double gyroNorm = Math.sqrt((double)gyrX*gyrX + (double)gyrY*gyrY + (double)gyrZ*gyrZ);
-                String row = String.format(Locale.US,
-                        "%.6f,%.6f," +                  // t, dt
-                                "%.3f,%.3f,%.3f," +            // acc
-                                "%.5f,%.5f,%.5f," +            // gyro
-                                "%.1f,%.1f,%.1f," +            // mag
-                                "%.1f,%.3f,%.1f," +            // yaw, gyroNorm, tilt
-                                "%.3f,%.3f,%.4f,%.4f,%.4f",    // aFwd_raw, aFwd, vFwd_raw, vFwd, P
-                        tSec, dtSec,
-                        accX, accY, accZ,
-                        gyrX, gyrY, gyrZ,
-                        magX, magY, magZ,
-                        yawDeg, gyroNorm, tiltDeg,
-                        aFwdRaw, aFwd, vFwdRaw, vFwd, latestP);
-                if (csv != null) csv.log(row);
-                rowsLogged++;
+                double azErr = Double.NaN;
+                E_world = N_world = Z_world = Float.NaN;
+                if (Rused != null) {
+                    float[] laW = new float[3];
+                    mulR(laW, Rused, laX, laY, laZ);
+                    E_world = laW[0]; // +East
+                    N_world = laW[1]; // +North
+                    Z_world = laW[2]; // +Up
 
-                // Stats
-                if (Double.isNaN(firstTSec)) firstTSec = tSec;
-                lastTSec = tSec;
-                if (dtSec > 0) {
-                    sumDt += dtSec; nDt += 1.0;
-                    if (dtSec < minDt) minDt = dtSec;
-                    if (dtSec > maxDt) maxDt = dtSec;
+                    // Projection onto desired azimuth (positive toward azimuth)
+                    double rad = Math.toRadians(cfg.poolAzimuthDeg);
+                    P = (float)(-(E_world * Math.sin(rad) + N_world * Math.cos(rad)));
+
+                    // Instantaneous world azimuth from E/N and its error vs desired
+                    double azFromEN = Math.toDegrees(Math.atan2(E_world, N_world));
+                    if (azFromEN < 0) azFromEN += 360.0;
+                    azErr = cfg.poolAzimuthDeg - azFromEN; // desired - measured
+                    if (azErr > 180) azErr -= 360;
+                    if (azErr < -180) azErr += 360;
+                } else {
+                    P = Float.NaN;
                 }
-                if (!Double.isNaN(aFwdRaw)) {
-                    nARaw++; sumARaw += aFwdRaw; sumA2Raw += aFwdRaw * aFwdRaw;
-                    sumAbsARaw += Math.abs(aFwdRaw);
-                    absARawList.add(Math.abs(aFwdRaw));
-                    if (Double.isNaN(t0Raw)) t0Raw = tSec;
-                    double x = tSec - t0Raw;
-                    sumXRaw += x; sumX2Raw += x*x; sumYRaw += aFwdRaw; sumXYRaw += x*aFwdRaw;
+
+                // Integrations (proper trapezoids)
+                double prevP = lastP_LA;
+                double vPprev = vP;
+
+                if (!Double.isNaN(P) && dtLa > 0) {
+                    if (!Double.isNaN(prevP)) vP += 0.5 * (P + prevP) * dtLa; // a -> v
+                    else                       vP += P * dtLa;
                 }
-                if (!Double.isNaN(aFwd)) {
-                    nACorr++; sumACorr += aFwd; sumA2Corr += aFwd*aFwd;
-                    sumAbsACorr += Math.abs(aFwd);
-                    absACorrList.add(Math.abs(aFwd));
-                    if (Double.isNaN(t0Corr)) t0Corr = tSec;
-                    double x = tSec - t0Corr;
-                    sumXCorr += x; sumX2Corr += x*x; sumYCorr += aFwd; sumXYCorr += x*aFwd;
+                if (!Double.isNaN(vP) && !Double.isNaN(vPprev) && dtLa > 0) {
+                    distance_vP += 0.5 * (vP + vPprev) * dtLa;               // v -> s
+                }
+
+                lastP_LA = P;
+                lastVP = vP;
+
+                // Log LA row (now includes azErrDeg at the end)
+                logLaRow(tLa, dtLa, yawDeg, tiltDeg, azErr);
+
+                // dt stats
+                if (Double.isNaN(firstLaTSec)) firstLaTSec = tLa;
+                lastLaTSec = tLa;
+                if (dtLa > 0) {
+                    sumDtLa += dtLa; nDtLa += 1.0;
+                    if (dtLa < minDtLa) minDtLa = dtLa;
+                    if (dtLa > maxDtLa) maxDtLa = dtLa;
                 }
                 break;
             }
         }
     }
 
-    /** Current UI velocity (HPF-integrated). */
-    public double getUiVelocity() { return vFwd; }
+    // ------------ logging helpers ------------
 
-    /** Update pool azimuth (degrees). */
-    public void setPoolAzimuthDeg(float deg) {
-        cfg.poolAzimuthDeg = deg;
-        Log.i(TAG, "POOL_AZIMUTH_DEG set to " + deg + "°");
+    private void logAccRow(double tAcc, double dtAcc, double yawDegNow, double tiltDegNow, double fduDeg) {
+        if (csvAcc == null) return;
+        String row = String.format(Locale.US,
+                "%.6f,%.6f," +            // tAcc, dtAcc
+                        "%.3f,%.3f,%.3f," +      // accX,accY,accZ
+                        "%.1f,%.1f," +           // yawDeg, tiltDeg
+                        "%.3f,%.3f,%.4f,%.4f,%.4f," + // aFwd_raw,aFwd,vFwd_raw,vFwd,distance_vFwd
+                        "%.1f",                   // FDU_degrees
+                tAcc, dtAcc,
+                accX, accY, accZ,
+                yawDegNow, tiltDegNow,
+                aFwdRaw, aFwd, vFwdRaw, vFwd, distance_vFwd,
+                fduDeg
+        );
+        csvAcc.log(row);
+        rowsAcc++;
     }
 
-    /** Get current pool azimuth (degrees). */
-    public float getPoolAzimuthDeg() { return cfg.poolAzimuthDeg; }
-
-    // ---------- internals ----------
-
-    private void resetForStart() {
-        // Timing & physics
-        lastAccNs = -1L;
-        lastAFwdRaw = lastAFwd = lastAFwdHPF = Double.NaN;
-        vFwdRaw = vFwd = 0.0;
-
-        // Bias
-        calibrating = true;
-        calibStartNs = -1L;
-        sumBias = 0.0; nBias = 0L; aBias = 0.0;
-
-        // Orientation / forward
-        hasR = false; fwdCaptured = false;
-
-        // ZUPT
-        yawBuf.clear(); lastZuputTSec = -1.0; zuptCount = 0;
-
-        // Stats
-        rowsLogged = 0;
-        firstTSec = Double.NaN; lastTSec = Double.NaN;
-        sumDt = 0.0; minDt = Double.POSITIVE_INFINITY; maxDt = 0.0; nDt = 0.0;
-        nARaw = 0; sumARaw = 0.0; sumA2Raw = 0.0; sumAbsARaw = 0.0; absARawList.clear();
-        t0Raw = Double.NaN; sumXRaw = 0.0; sumX2Raw = 0.0; sumYRaw = 0.0; sumXYRaw = 0.0;
-        nACorr = 0; sumACorr = 0.0; sumA2Corr = 0.0; sumAbsACorr = 0.0; absACorrList.clear();
-        t0Corr = Double.NaN; sumXCorr = 0.0; sumX2Corr = 0.0; sumYCorr = 0.0; sumXYCorr = 0.0;
-
-        // HPF
-        hpf = new OnePoleHPF(cfg.HPF_FC_HZ);
-
-        // P dependencies
-        latestP = Float.NaN;
-        hasGrav = false; hasMag = false;
+    private void logLaRow(double tLa, double dtLa, double yawDegNow, double tiltDegNow, double azErrDeg) {
+        if (csvLa == null) return;
+        String row = String.format(Locale.US,
+                "%.6f,%.6f," +            // tLa, dtLa
+                        "%.3f,%.3f,%.3f," +      // laX,laY,laZ
+                        "%.1f,%.1f,%.1f," +      // yawDeg, tiltDeg, azimuthDeg
+                        "%.4f,%.4f,%.4f," +      // P, vP, distance_vP
+                        "%.4f,%.4f,%.4f," +      // E_world, N_world, Z_world
+                        "%.1f",                   // azErrDeg
+                tLa, dtLa,
+                laX, laY, laZ,
+                yawDegNow, tiltDegNow, (double)cfg.poolAzimuthDeg,
+                P, vP, distance_vP,
+                E_world, N_world, Z_world,
+                azErrDeg
+        );
+        csvLa.log(row);
+        rowsLa++;
     }
 
-    private void checkTurnZUPT(double tSec) {
-        if (!cfg.ZUPT_ENABLED) return;
-        if (yawBuf.size() < 3) return;
-
-        double minYaw = Double.POSITIVE_INFINITY, maxYaw = Double.NEGATIVE_INFINITY;
-        for (YawSample s : yawBuf) {
-            if (s.yawDegUnwrapped < minYaw) minYaw = s.yawDegUnwrapped;
-            if (s.yawDegUnwrapped > maxYaw) maxYaw = s.yawDegUnwrapped;
-        }
-        double span = maxYaw - minYaw;
-        if (span >= cfg.TURN_YAW_DELTA_DEG) {
-            if (lastZuputTSec < 0.0 || (tSec - lastZuputTSec) >= cfg.ZUPT_MIN_INTERVAL_S) {
-                vFwd = 0.0; vFwdRaw = 0.0;
-                lastZuputTSec = tSec; zuptCount++;
-                Log.i(TAG, String.format(Locale.US,
-                        "ZUPT@turn t=%.3f yaw_span=%.1f° (window=%.2fs) -> v=0",
-                        tSec, span, cfg.TURN_WINDOW_S));
-            }
-        }
-    }
-
-    private String[] buildStatsFooter() {
-        double duration = (!Double.isNaN(firstTSec) && !Double.isNaN(lastTSec)) ? (lastTSec - firstTSec) : 0.0;
-        double avgDt = (nDt > 0) ? (sumDt / nDt) : 0.0;
-        double hz = (avgDt > 0) ? (1.0 / avgDt) : 0.0;
-
-        double meanARaw = (nARaw > 0) ? (sumARaw / nARaw) : Double.NaN;
-        double varARaw  = (nARaw > 1) ? Math.max(0.0, (sumA2Raw / nARaw) - (meanARaw * meanARaw)) : Double.NaN;
-        double stdARaw  = (nARaw > 1) ? Math.sqrt(varARaw) : Double.NaN;
-        double meanAbsARaw = (nARaw > 0) ? (sumAbsARaw / nARaw) : Double.NaN;
-
-        double p95AbsRaw = percentile95(absARawList);
-
-        double slopeRaw = slopeVsTime(nARaw, t0Raw, sumXRaw, sumX2Raw, sumYRaw, sumXYRaw);
-
-        double meanACorr = (nACorr > 0) ? (sumACorr / nACorr) : Double.NaN;
-        double varACorr  = (nACorr > 1) ? Math.max(0.0, (sumA2Corr / nACorr) - (meanACorr * meanACorr)) : Double.NaN;
-        double stdACorr  = (nACorr > 1) ? Math.sqrt(varACorr) : Double.NaN;
-        double meanAbsACorr = (nACorr > 0) ? (sumAbsACorr / nACorr) : Double.NaN;
-
-        double p95AbsCorr = percentile95(absACorrList);
-
-        double slopeCorr = slopeVsTime(nACorr, t0Corr, sumXCorr, sumX2Corr, sumYCorr, sumXYCorr);
-
-        double tau = 1.0 / (2.0 * Math.PI * cfg.HPF_FC_HZ);
-
-        ArrayList<String> lines = new ArrayList<>();
-        lines.add("# ---- STATS BEGIN ----");
-        lines.add(String.format(Locale.US, "# rows_logged=%d", rowsLogged));
-        lines.add(String.format(Locale.US, "# duration_s=%.6f", duration));
-        lines.add(String.format(Locale.US, "# dt_avg_s=%.6f dt_min_s=%.6f dt_max_s=%.6f approx_Hz=%.2f",
-                avgDt, (Double.isInfinite(minDt)?0.0:minDt), maxDt, hz));
-
-        lines.add(String.format(Locale.US, "# aBias=%.6f m/s^2 (calib_n=%d, window_s=%.1f, calibrating=%s)",
-                aBias, nBias, cfg.CAL_WINDOW_S, Boolean.toString(calibrating)));
-
-        lines.add(String.format(Locale.US, "# HPF_fc_hz=%.3f tau_s=%.3f (UI velocity integrates HPF(aFwd))",
-                cfg.HPF_FC_HZ, tau));
-
-        lines.add(String.format(Locale.US, "# ZUPT_turns=%d (window_s=%.2f, min_span_deg=%.0f, min_interval_s=%.1f)",
-                zuptCount, cfg.TURN_WINDOW_S, cfg.TURN_YAW_DELTA_DEG, cfg.ZUPT_MIN_INTERVAL_S));
-
-        lines.add(String.format(Locale.US, "# RAW  aFwd_mean=%.6f aFwd_std=%.6f aFwd_mean_abs=%.6f aFwd_p95_abs=%.6f",
-                meanARaw, stdARaw, meanAbsARaw, p95AbsRaw));
-        lines.add(String.format(Locale.US, "# RAW  aFwd_slope_vs_time=%.8f m/s^3", slopeRaw));
-        lines.add(String.format(Locale.US, "# RAW  vFwd_final=%.6f m/s", vFwdRaw));
-
-        lines.add(String.format(Locale.US, "# CORR aFwd_mean=%.6f aFwd_std=%.6f aFwd_mean_abs=%.6f aFwd_p95_abs=%.6f",
-                meanACorr, stdACorr, meanAbsACorr, p95AbsCorr));
-        lines.add(String.format(Locale.US, "# CORR aFwd_slope_vs_time=%.8f m/s^3", slopeCorr));
-        lines.add(String.format(Locale.US, "# CORR vFwd_final=%.6f m/s", vFwd));
-
-        lines.add("# ---- STATS END ----");
-        return lines.toArray(new String[0]);
-    }
+    // ------------ math helpers ------------
 
     private static double clamp(double v, double lo, double hi) {
         return (v < lo) ? lo : (v > hi) ? hi : v;
     }
 
+    // out = R * [x,y,z], with R 3x3 row-major
     private static void mulR(float[] out, float[] R, float x, float y, float z) {
         out[0] = R[0]*x + R[1]*y + R[2]*z;
         out[1] = R[3]*x + R[4]*y + R[5]*z;
@@ -453,22 +454,5 @@ public class MotionPipeline {
     private static void normalize3(float[] v) {
         double n = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
         if (n > 0) { v[0]/=n; v[1]/=n; v[2]/=n; }
-    }
-
-    private static double percentile95(ArrayList<Double> list) {
-        if (list.isEmpty()) return Double.NaN;
-        Collections.sort(list);
-        int m = list.size();
-        int idx = (int) Math.floor(0.95 * (m - 1));
-        idx = Math.max(0, Math.min(idx, m - 1));
-        return list.get(idx);
-    }
-
-    private static double slopeVsTime(long n, double t0, double sumX, double sumX2, double sumY, double sumXY) {
-        if (n <= 1) return Double.NaN;
-        double N = (double) n;
-        double denom = N * sumX2 - sumX * sumX;
-        if (Math.abs(denom) <= 1e-12) return Double.NaN;
-        return (N * sumXY - sumX * sumY) / denom;
     }
 }

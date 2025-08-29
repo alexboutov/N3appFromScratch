@@ -1,6 +1,8 @@
 package com.example.n3appfromscratch;
 
 import android.content.Context;
+import android.os.Build;
+import android.os.Environment;
 import android.os.StatFs;
 import android.util.Log;
 
@@ -8,130 +10,190 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.text.DecimalFormat;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 
-class CsvLogger {
-    private static final String TAG = "Nat3_Sensors";
+/**
+ * Simple CSV logger with optional file-size rollover and a filename suffix hook.
+ * Creates files like: run_YYYYMMDD_HHmmss[_suffix]_pXX.csv in app's external files /logs.
+ */
+public class CsvLogger {
+    private static final String TAG = "CsvLogger";
 
     private final Context ctx;
-    private BufferedWriter out;
-    private File dir;
-    private File file;
-    private String header = "";
-    private String baseName = ""; // run_YYYYMMDD_HHMMSS
-    private int partIndex = 0;
-    private long maxBytes = Long.MAX_VALUE; // rotation threshold; set via setMaxBytes()
+    private File logsDir;
+    private BufferedWriter bw;
+    private File currentFile;
 
-    CsvLogger(Context ctx) {
+    private long maxBytes = 10L * 1024L * 1024L; // default 10 MB per part; set via setMaxBytes(...)
+    private int partIndex = 1;
+    private String timestampStamp;               // run-level timestamp (YYYYMMDD_HHmmss)
+    private String headerLine = null;
+    private boolean started = false;
+
+    // NEW: optional suffix (e.g., "_acc", "_la")
+    private String nameSuffix = "";
+
+    public CsvLogger(Context ctx) {
         this.ctx = ctx.getApplicationContext();
-    }
-
-    /** Optional: set per-file size limit (bytes). Call before start(). */
-    void setMaxBytes(long bytes) {
-        this.maxBytes = Math.max(1L, bytes);
-    }
-
-    /** Begin a new run with a timestamped base name and write the header. */
-    void start(String header) {
-        this.header = (header == null) ? "" : header;
-        dir = new File(ctx.getExternalFilesDir(null), "logs");
-        if (!dir.exists() && !dir.mkdirs()) {
-            Log.e(TAG, "Failed to create logs dir: " + dir);
-            return;
-        }
-        baseName = "run_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        partIndex = 0;
-        rollToNextPart(); // opens _p01 and writes header
-        if (file != null) {
-            Log.i(TAG, "Logging to: " + file.getAbsolutePath());
+        this.logsDir = resolveLogsDir(this.ctx);
+        if (!logsDir.exists() && !logsDir.mkdirs()) {
+            Log.w(TAG, "Failed to create logs dir: " + logsDir.getAbsolutePath());
         }
     }
 
-    /** Write one CSV row; rotate to a new file if size threshold reached. */
-    void log(String row) {
-        if (out == null) return;
+    /** Optional: tag the filename, e.g. "_acc" / "_la". */
+    public void setNameSuffix(String suffix) {
+        this.nameSuffix = (suffix == null) ? "" : suffix.trim();
+    }
+
+    /** Optional: set per-file size limit in bytes (<=0 disables rollover). */
+    public void setMaxBytes(long maxBytes) {
+        this.maxBytes = (maxBytes <= 0) ? Long.MAX_VALUE : maxBytes;
+    }
+
+    /** Start a new run; writes the header into the first part. */
+    public synchronized void start(String header) {
+        this.headerLine = header;
+        this.timestampStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        this.partIndex = 1;
+        openNewPart(); // also writes header
+        this.started = true;
+    }
+
+    /** Write a CSV row (without adding another header). */
+    public synchronized void log(String line) {
+        if (!started || bw == null) return;
         try {
-            out.write(row);
-            out.newLine();
-            if (file != null && file.length() >= maxBytes) {
-                rollToNextPart();
+            // roll if adding this line would exceed limit
+            long pendingBytes = (line == null ? 0 : line.getBytes(StandardCharsets.UTF_8).length) + 1; // + newline
+            if (currentFile.length() + pendingBytes > maxBytes) {
+                // rollover
+                closeQuietly();
+                partIndex++;
+                openNewPart(); // writes header again
             }
+            bw.write(line);
+            bw.newLine();
         } catch (IOException e) {
-            Log.e(TAG, "CsvLogger.log error", e);
+            Log.e(TAG, "log() failed", e);
         }
     }
 
-    /** Finish the run; append header again + optional footer, then close. */
-    void finishWithFooter(String repeatHeader, String[] footerLines) {
-        if (out == null) return;
+    /**
+     * Finish the run: repeat header and append footer lines, then close.
+     * If headerRepeat is null, reuses the original headerLine.
+     */
+    public synchronized void finishWithFooter(String headerRepeat, String[] footerLines) {
+        if (!started) return;
         try {
-            if (repeatHeader != null && !repeatHeader.isEmpty()) {
-                out.write(repeatHeader);
-                out.newLine();
+            String hdr = (headerRepeat != null) ? headerRepeat : headerLine;
+            if (hdr != null) {
+                bw.write(hdr);
+                bw.newLine();
             }
             if (footerLines != null) {
                 for (String s : footerLines) {
-                    out.write(s);
-                    out.newLine();
+                    if (s == null) continue;
+                    bw.write(s);
+                    bw.newLine();
                 }
             }
-            out.flush();
         } catch (IOException e) {
-            Log.e(TAG, "CsvLogger.finishWithFooter error", e);
+            Log.e(TAG, "finishWithFooter() write failed", e);
         } finally {
-            close();
+            closeQuietly();
+            started = false;
         }
     }
 
-    void close() {
-        try { if (out != null) out.close(); } catch (IOException ignored) {}
-        out = null;
-        file = null;
+    /** Returns the current file (may be null before start or after finish). */
+    public synchronized File getFile() {
+        return currentFile;
     }
 
-    File getFile() { return file; }
-    File getDir()  { return dir;  }
+    // ---------- helpers ----------
 
-    // ---------- Rotation helpers ----------
-    private void rollToNextPart() {
-        close();
-        partIndex++;
-        file = new File(dir, baseName + String.format(Locale.US, "_p%02d.csv", partIndex));
+    private void openNewPart() {
+        String fname = String.format(Locale.US,
+                "run_%s%s_p%02d.csv",
+                timestampStamp,
+                (nameSuffix.isEmpty() ? "" : nameSuffix),
+                partIndex);
+        currentFile = new File(logsDir, fname);
         try {
-            out = new BufferedWriter(new FileWriter(file, /*append*/ false));
-            if (!header.isEmpty()) {
-                out.write(header);
-                out.newLine();
-                out.flush();
+            bw = new BufferedWriter(new FileWriter(currentFile, false));
+            if (headerLine != null) {
+                bw.write(headerLine);
+                bw.newLine();
             }
-            Log.i(TAG, "Switched to: " + file.getAbsolutePath());
         } catch (IOException e) {
-            Log.e(TAG, "CsvLogger.rollToNextPart error", e);
-            close();
+            Log.e(TAG, "openNewPart() failed", e);
+            closeQuietly();
         }
     }
 
-    // ---------- Storage utilities ----------
-    static long availableBytes(Context ctx) {
-        File base = new File(ctx.getExternalFilesDir(null), ".");
-        StatFs fs = new StatFs(base.getAbsolutePath());
-        return fs.getAvailableBytes();
+    private void closeQuietly() {
+        if (bw != null) {
+            try { bw.flush(); } catch (IOException ignored) {}
+            try { bw.close(); } catch (IOException ignored) {}
+        }
+        bw = null;
     }
 
-    static long totalBytes(Context ctx) {
-        File base = new File(ctx.getExternalFilesDir(null), ".");
-        StatFs fs = new StatFs(base.getAbsolutePath());
-        return fs.getTotalBytes();
+    private static File resolveLogsDir(Context ctx) {
+        File base = ctx.getExternalFilesDir("logs");
+        if (base == null) {
+            // Fallback to internal app files
+            base = new File(ctx.getFilesDir(), "logs");
+        }
+        return base;
     }
 
-    static String human(long bytes) {
-        String[] units = {"B","KB","MB","GB","TB"};
-        double b = bytes;
-        int u = 0;
-        while (b >= 1024 && u < units.length-1) { b /= 1024; u++; }
-        return new DecimalFormat("#,##0.0").format(b) + " " + units[u];
+    // ---------- disk info & utilities (static) ----------
+
+    public static long availableBytes(Context ctx) {
+        File dir = resolveLogsDir(ctx);
+        try {
+            StatFs fs = new StatFs(dir.getAbsolutePath());
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                return fs.getAvailableBytes();
+            } else {
+                //noinspection deprecation
+                return (long) fs.getAvailableBlocks() * (long) fs.getBlockSize();
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "availableBytes() failed", t);
+            return -1L;
+        }
+    }
+
+    public static long totalBytes(Context ctx) {
+        File dir = resolveLogsDir(ctx);
+        try {
+            StatFs fs = new StatFs(dir.getAbsolutePath());
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                return fs.getTotalBytes();
+            } else {
+                //noinspection deprecation
+                return (long) fs.getBlockCount() * (long) fs.getBlockSize();
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "totalBytes() failed", t);
+            return -1L;
+        }
+    }
+
+    /** Human-readable byte size (e.g., "10.5 MB"). */
+    public static String human(long bytes) {
+        if (bytes < 0) return "?";
+        if (bytes < 1024) return bytes + " B";
+        double v = bytes;
+        String[] units = {"KB", "MB", "GB", "TB"};
+        int i = -1;
+        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+        return String.format(Locale.US, "%.1f %s", v, units[i]);
     }
 }
