@@ -31,9 +31,10 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
 
     // LA-file header (azimuth-forward pipeline / legacy P)
     private static final String HEADER_LA =
-            "tLa,dtLa,laX,laY,laZ,yawDeg,tiltDeg,azimuthDeg," +
-                    "P,vP,distance_vP," +
-                    "E_world,N_world,Z_world,azErrDeg";
+            "tLa,dtLa,LA time elapsed, sec,laX,laY,laZ,yawDeg,tiltDeg,azimuthDeg," +
+                    "P_raw,P_bias,P,vP,distance_vP," +
+                    "E_world,N_world,Z_world,azErrDeg,gyroNorm,laRms,isStill," +
+                    "laRawNs,dtLa_ns,dtFlag";
 
     private ActivityMainBinding binding;
     private SensorManager sm;
