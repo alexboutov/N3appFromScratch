@@ -5,43 +5,50 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
-import android.os.Bundle;
 import android.util.Log;
-
-import androidx.appcompat.app.AppCompatActivity;
-
-import com.example.n3appfromscratch.databinding.ActivityMainBinding;
 
 import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * Minimal LA logger controlled by the existing START/STOP button in activity_main.xml.
- * CSV columns: tLa,dtLa,laX,laY,laZ
+ * Minimal linear-acceleration logger for the "minim" branch.
+ * Writes a CSV with header: tLa,dtLa,laX,laY,laZ
+ * and a footer with dt statistics and sensor info.
  *
- * - Press START: begins logging TYPE_LINEAR_ACCELERATION at FASTEST rate.
- * - Press STOP: stops listening and finalizes the CSV with a small footer.
+ * Usage (in your MainActivity START/STOP handlers):
  *
- * No automatic start/stop in lifecycle methods.
+ *   // field:
+ *   private LaMinimLogger laMinim;
+ *
+ *   // on START:
+ *   if (laMinim == null) laMinim = new LaMinimLogger();
+ *   laMinim.start(this, 10L * 1024 * 1024); // 10 MB per file (adjust as desired)
+ *
+ *   // on STOP:
+ *   if (laMinim != null) { laMinim.stop(); laMinim = null; }
  */
-public final class MainActivity extends AppCompatActivity implements SensorEventListener {
+public final class LaMinimLogger implements SensorEventListener {
 
-    private static final String TAG = "LA_MINIM";
-    private static final String HEADER = "tLa,dtLa,laX,laY,laZ";
+    private static final String TAG = "LaMinimLogger";
 
-    private ActivityMainBinding binding;
+    // CSV header
+    private static final String HEADER =
+            "tLa,dtLa,laX,laY,laZ";
 
-    // Sensors
+    // File suffix to distinguish from other logs
+    private static final String FILE_SUFFIX = "_la_minim";
+
+    // Android
     private SensorManager sm;
-    private Sensor linAcc;
+    private Sensor laSensor;
 
     // Logging
     private CsvLogger csv;
-    private boolean isLogging = false;
-    private long lastLaNs = -1L;
+    private long maxBytes = 10L * 1024 * 1024; // default 10 MB cap
 
-    // Footer stats
-    private long rows = 0L;
+    // Timebase
+    private long   lastLaNs = -1L;
+    private long   rows = 0L;
     private double firstTSec = Double.NaN, lastTSec = Double.NaN;
     private double sumDt = 0.0, minDt = Double.POSITIVE_INFINITY, maxDt = 0.0, nDt = 0.0;
 
@@ -49,53 +56,41 @@ public final class MainActivity extends AppCompatActivity implements SensorEvent
     private long dtLaNegCount = 0L, dtLaZeroCount = 0L;
     private long maxNegDtLaNs = 0L, minPosDtLaNs = Long.MAX_VALUE;
 
-    // sensor info (for footer)
+    // sensor info
     private boolean sensorInfoLogged = false;
     private String sensorName = null, sensorVendor = null;
     private int sensorVersion = 0;
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        binding = ActivityMainBinding.inflate(getLayoutInflater());
-        setContentView(binding.getRoot());
+    public LaMinimLogger() {}
 
-        sm = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
-        linAcc = (sm != null) ? sm.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION) : null;
+    /**
+     * Begin logging LA to a new CSV.
+     * @param ctx Android context
+     * @param perFileLimitBytes max bytes per file (CsvLogger will roll)
+     */
+    public void start(Context ctx, long perFileLimitBytes) {
+        stop(); // be safe
 
-        // Info line
-        String info = "Sensors: " + ((linAcc != null) ? "LA" : "—");
-        binding.tvInfo.setText(info + "  (button controls logging)");
+        this.maxBytes = perFileLimitBytes > 0 ? perFileLimitBytes : this.maxBytes;
 
-        // Button wiring
-        binding.btnStartStop.setOnClickListener(v -> {
-            if (!isLogging) {
-                startLogging();
-            } else {
-                stopLogging();
-            }
-        });
-
-        // Ensure correct initial state
-        binding.btnStartStop.setText(isLogging ? "STOP" : "START");
-    }
-
-    // No auto start/stop in lifecycle per request
-
-    private void startLogging() {
-        if (linAcc == null || sm == null) {
-            Log.w(TAG, "Cannot start: LA sensor not available.");
+        sm = (SensorManager) ctx.getSystemService(Context.SENSOR_SERVICE);
+        laSensor = sm.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION);
+        if (laSensor == null) {
+            Log.w(TAG, "No TYPE_LINEAR_ACCELERATION sensor on this device.");
             return;
         }
 
-        // Create CSV
-        long limitBytes = 10L * 1024 * 1024; // 10 MB cap per file
-        csv = new CsvLogger(this);
-        csv.setFileSuffix("_la_minim");       // requires CsvLogger provided below
-        csv.setMaxBytes(limitBytes);
+        // create CSV
+        csv = new CsvLogger(ctx);
+        csv.setFileSuffix(FILE_SUFFIX);
+        csv.setMaxBytes(this.maxBytes);
         csv.start(HEADER);
 
-        // Reset stats/timebase
+        // register listener
+        int rate = SensorManager.SENSOR_DELAY_FASTEST;
+        sm.registerListener(this, laSensor, rate);
+
+        // reset stats
         lastLaNs = -1L;
         rows = 0L;
         firstTSec = Double.NaN; lastTSec = Double.NaN;
@@ -103,59 +98,53 @@ public final class MainActivity extends AppCompatActivity implements SensorEvent
         dtLaNegCount = 0L; dtLaZeroCount = 0L; maxNegDtLaNs = 0L; minPosDtLaNs = Long.MAX_VALUE;
         sensorInfoLogged = false; sensorName = sensorVendor = null; sensorVersion = 0;
 
-        // Register listener
-        sm.registerListener(this, linAcc, SensorManager.SENSOR_DELAY_FASTEST);
-
-        isLogging = true;
-        binding.btnStartStop.setText("STOP");
-        binding.tvInfo.setText("Logging LA… (press STOP to finish)");
-        Log.i(TAG, "Logging STARTED");
+        Log.i(TAG, "LA minim logging STARTED");
     }
 
-    private void stopLogging() {
-        // Unregister
-        if (sm != null) sm.unregisterListener(this);
-
-        // Finalize CSV with footer
+    /**
+     * Stop logging and write footer.
+     */
+    public void stop() {
+        if (sm != null) {
+            sm.unregisterListener(this);
+        }
         if (csv != null) {
             csv.finishWithFooter(HEADER, buildFooter());
             csv = null;
+            Log.i(TAG, "LA minim logging STOPPED");
         }
-
-        isLogging = false;
-        binding.btnStartStop.setText("START");
-        binding.tvInfo.setText("Stopped. (press START to log LA)");
-        Log.i(TAG, "Logging STOPPED");
+        sm = null;
+        laSensor = null;
     }
 
     @Override
     public void onSensorChanged(SensorEvent event) {
-        if (!isLogging || csv == null) return;
         if (event.sensor.getType() != Sensor.TYPE_LINEAR_ACCELERATION) return;
+        if (csv == null) return; // not started
 
         if (!sensorInfoLogged) {
             sensorName = event.sensor.getName();
             sensorVendor = event.sensor.getVendor();
             sensorVersion = event.sensor.getVersion();
             sensorInfoLogged = true;
+            Log.i(TAG, "LA sensor: " + sensorName + " | vendor=" + sensorVendor + " | v=" + sensorVersion);
         }
 
-        // Values
+        // values
         final float laX = event.values[0];
         final float laY = event.values[1];
         final float laZ = event.values[2];
 
-        // Timebase
-        final long nowNs = event.timestamp;
-        final double tLa = nowNs / 1e9;
-        final long dtNs = (lastLaNs > 0L) ? (nowNs - lastLaNs) : 0L;
-        final double dtLa = (lastLaNs > 0L) ? (dtNs / 1_000_000_000.0) : 0.0;
+        // timebase
+        final long  nowNs = event.timestamp;
+        final double tLa  = nowNs / 1e9;
+        final long  dtNs  = (lastLaNs > 0) ? (nowNs - lastLaNs) : 0L;
+        final double dtLa = (lastLaNs > 0) ? (dtNs / 1_000_000_000.0) : 0.0;
         lastLaNs = nowNs;
 
         // dt diagnostics & stats
-        if (dtNs == 0L) {
-            dtLaZeroCount++;
-        } else if (dtNs < 0L) {
+        if (dtNs == 0L) dtLaZeroCount++;
+        else if (dtNs < 0L) {
             dtLaNegCount++;
             long neg = -dtNs;
             if (neg > maxNegDtLaNs) maxNegDtLaNs = neg;
@@ -172,7 +161,7 @@ public final class MainActivity extends AppCompatActivity implements SensorEvent
             if (dtLa > maxDt) maxDt = dtLa;
         }
 
-        // Row
+        // CSV row
         final String row = String.format(Locale.US,
                 "%.6f,%.6f,%.3f,%.3f,%.3f",
                 tLa, dtLa, laX, laY, laZ);
